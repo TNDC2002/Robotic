@@ -3,9 +3,9 @@
 #SBATCH --partition=mig
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
-#SBATCH --time=72:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=96G
+#SBATCH --time=0
 #SBATCH --output=logs/slurm-%j.out
 #SBATCH --error=logs/slurm-%j.err
 
@@ -32,8 +32,8 @@ echo "pwd=$(pwd)"
 echo "python=$(command -v python)"
 python -V
 echo "start=$(date -Is)"
-echo "cmd=python train_nav_rl.py --timesteps 4000000 --n-envs 16"
+echo "cmd=python train_nav_rl.py --timesteps 4000000 --n-envs 8"
 
-python train_nav_rl.py --timesteps 4000000 --n-envs 16
+python train_nav_rl.py --timesteps 4000000 --n-envs 8 --n-steps 1024 --batch-size 512
 
 echo "end=$(date -Is)"
