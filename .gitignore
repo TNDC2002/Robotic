@@ -10,3 +10,4 @@ __pycache__/
 *.pywzz
 *.pyzzz
 *.pywzzz
+/drone_blender_model

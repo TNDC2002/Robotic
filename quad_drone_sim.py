@@ -1,9 +1,10 @@
 """
-Minimal quad-style thrust on a flat rectangular box in PyBullet.
+Minimal quad-style thrust on a flat body in PyBullet.
 
-Four forces are applied at the top corners of the box, each along the
-body +Z axis (like rotors). A simple PD loop holds altitude and damps
-roll/pitch so the "drone" can hover.
+Physics uses a simple box collision shape; rendering uses the Blender
+OBJ mesh in ``drone_blender_model/``. Four forces are applied at the top
+corners of the box, each along the body +Z axis (like rotors). A simple
+PD loop holds altitude and damps roll/pitch so the drone can hover.
 
 Run (after activating .venv):
   python quad_drone_sim.py
@@ -13,6 +14,8 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
+import tempfile
 
 import pybullet as p
 import pybullet_data
@@ -26,6 +29,41 @@ def _urdf_path_ok_for_loader(path: str) -> bool:
     except UnicodeEncodeError:
         return False
     return os.path.isfile(path)
+
+
+def resolve_drone_mesh_path() -> str:
+    """Return an ASCII-safe path to drone.obj for PyBullet's mesh loader."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    obj = os.path.normpath(os.path.join(here, "drone_blender_model", "drone.obj"))
+    mtl = os.path.normpath(os.path.join(here, "drone_blender_model", "drone.mtl"))
+    if not os.path.isfile(obj):
+        raise FileNotFoundError(f"Drone mesh not found: {obj}")
+    if _urdf_path_ok_for_loader(obj):
+        return obj
+
+    cache_dir = os.path.join(tempfile.gettempdir(), "robotic_drone_mesh")
+    os.makedirs(cache_dir, exist_ok=True)
+    cached_obj = os.path.join(cache_dir, "drone.obj")
+    cached_mtl = os.path.join(cache_dir, "drone.mtl")
+    shutil.copy2(obj, cached_obj)
+    if os.path.isfile(mtl):
+        shutil.copy2(mtl, cached_mtl)
+    return cached_obj
+
+
+def create_drone_visual_shape() -> int:
+    mesh_path = resolve_drone_mesh_path()
+    mesh_dir = os.path.dirname(mesh_path)
+    if mesh_dir:
+        p.setAdditionalSearchPath(mesh_dir)
+    mesh_scale = (MESH_SCALE, MESH_SCALE, MESH_SCALE)
+    vis_orn = p.getQuaternionFromEuler(MESH_VIS_EULER)
+    return p.createVisualShape(
+        p.GEOM_MESH,
+        fileName=mesh_path,
+        meshScale=mesh_scale,
+        visualFrameOrientation=vis_orn,
+    )
 
 
 def load_ground_plane() -> None:
@@ -51,6 +89,13 @@ HALF_EXTENTS = (0.22, 0.10, 0.02)
 MASS = 0.45
 HOVER_Z = 0.85
 DT = 1.0 / 240.0
+# Wall-clock pause per physics frame in GUI mode (0 = run as fast as possible).
+GUI_STEP_SLEEP_S = 0.01
+REALTIME_STEP_SLEEP_S = DT
+
+# Blender OBJ export (meters after scale): ~0.44 x 0.53 x 0.08 with +90 deg about X
+MESH_SCALE = 0.07
+MESH_VIS_EULER = (math.pi / 2.0, 0.0, 0.0)
 
 
 def motor_corners_local(hx: float, hy: float, hz: float) -> list[tuple[float, float, float]]:
@@ -112,6 +157,24 @@ def allocate_motor_thrusts(
 
 
 def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Quad drone hover sim (PyBullet GUI).")
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=GUI_STEP_SLEEP_S,
+        metavar="SEC",
+        help=f"Seconds to pause each frame for visibility (default {GUI_STEP_SLEEP_S}; 0 = max speed)",
+    )
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help=f"Match sim clock (~{1.0 / DT:.0f} Hz); overrides --sleep",
+    )
+    args = parser.parse_args()
+    step_sleep_s = REALTIME_STEP_SLEEP_S if args.realtime else max(0.0, args.sleep)
+
     cid = p.connect(p.GUI)
     p.setGravity(0.0, 0.0, -9.81)
     load_ground_plane()
@@ -119,7 +182,7 @@ def main() -> None:
 
     hx, hy, hz = HALF_EXTENTS
     col = p.createCollisionShape(p.GEOM_BOX, halfExtents=HALF_EXTENTS)
-    vis = p.createVisualShape(p.GEOM_BOX, halfExtents=HALF_EXTENTS, rgbaColor=(0.2, 0.55, 0.9, 1.0))
+    vis = create_drone_visual_shape()
     # Start level so body +Z is world +Z (rotor normal up); avoid landing flat then losing vertical thrust.
     start = (0.0, 0.0, 0.55)
     start_orn = (0.0, 0.0, 0.0, 1.0)
@@ -144,7 +207,7 @@ def main() -> None:
     # Per-motor ceiling: must exceed hover share (mg/4) plus room for attitude mixing.
     max_motor = MASS * g * 0.65
 
-    print("Quad box sim — hover hold at target Z. Keys: W/S target height, Q/E roll trim, A/D pitch trim, ESC quit.")
+    print("Quad drone sim — hover hold at target Z. Keys: W/S target height, Q/E roll trim, A/D pitch trim, ESC quit.")
     target_z = HOVER_Z
     roll_trim = pitch_trim = 0.0
 
@@ -178,12 +241,14 @@ def main() -> None:
         thrust_sum = MASS * g + kp_z * z_e - kd_z * vz_e
         thrust_sum = max(0.0, thrust_sum)
 
-        # Distribute corrections: roll uses left/right (Y), pitch uses front/back (X)
+        # Roll: left/right (Y). Pitch: front/back (X) — opposite sign vs roll (see env).
         mix_r = -kp_rp * roll_e - kd_rp * ang_vel[0]
-        mix_p = -kp_rp * pitch_e - kd_rp * ang_vel[1]
+        mix_p = +kp_rp * pitch_e + kd_rp * ang_vel[1]
 
         thrusts = allocate_motor_thrusts(thrust_sum, mix_r, mix_p, signs_xy, max_motor)
 
+
+        # for testing - dont remove this part
         thrusts = [1.10405, 1.10405, 1.104, 1.104]
         print(thrusts)
 
@@ -194,7 +259,8 @@ def main() -> None:
             force = scale_vec(thrust_dir, t)
             p.applyExternalForce(drone, -1, force, world_point, p.WORLD_FRAME)
 
-        time.sleep(0.01)
+        if step_sleep_s > 0.0:
+            time.sleep(step_sleep_s)
         p.stepSimulation()
 
     p.disconnect()
