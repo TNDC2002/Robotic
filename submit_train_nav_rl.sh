@@ -26,6 +26,7 @@ SLURM_ERR="${REPO_ROOT}/logs/slurm-%j.out"
 echo "Submitting from: ${REPO_ROOT}"
 echo "SLURM stdout/stderr: ${SLURM_OUT}"
 echo "Backup job log:     ${REPO_ROOT}/logs/job_<jobid>.log"
+echo "Bootstrap log:      ${REPO_ROOT}/logs/bootstrap.log (always appended)"
 
 job_id="$(
   sbatch \
@@ -44,3 +45,4 @@ echo "  squeue -j ${job_num}"
 echo "  sacct -j ${job_num} --format=JobID,State,ExitCode,Elapsed,MaxRSS,ReqMem"
 echo "  tail -f ${REPO_ROOT}/logs/slurm-${job_num}.out"
 echo "  tail -f ${REPO_ROOT}/logs/job_${job_num}.log"
+echo "  tail -f ${REPO_ROOT}/logs/bootstrap.log"

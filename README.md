@@ -130,7 +130,8 @@ Always submit via `./submit_train_nav_rl.sh` (it creates `logs/` before `sbatch`
 Log files:
 
 - `logs/slurm-<jobid>.out` — SLURM stdout+stderr (same file)
-- `logs/job_<jobid>.log` — backup copy inside the repo (tee)
+- `logs/job_<jobid>.log` — per-job copy written by the batch script
+- `logs/bootstrap.log` — first lines written before `set -e` (check this if `slurm-*.out` is empty)
 
 If a job dies immediately, check scheduler state:
 
