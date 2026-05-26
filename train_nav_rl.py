@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from quad_nav_env import NavEnvConfig, QuadNavEnv, QuadNavGymEnv, make_nav_env
+from quad_nav_env import NavEnvConfig, NavWindRandomizationConfig, QuadNavEnv, QuadNavGymEnv, make_nav_env
 
 
 def _require_gym():
@@ -25,14 +25,20 @@ def _require_gym():
         )
 
 
-def build_vec_env(n_envs: int, seed: int):
+def build_vec_env(n_envs: int, seed: int, *, no_wind: bool, action_mode: str):
     _require_gym()
     from stable_baselines3.common.env_util import make_vec_env
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv
 
     def _factory():
-        cfg = NavEnvConfig(gui=False, step_sleep_s=0.0)
+        wr = NavWindRandomizationConfig(enabled=not no_wind)
+        cfg = NavEnvConfig(
+            gui=False,
+            step_sleep_s=0.0,
+            wind_randomization=wr,
+            action_mode=action_mode,  # type: ignore[arg-type]
+        )
         return Monitor(QuadNavGymEnv(cfg))
 
     # DummyVecEnv: one PyBullet client per env, reliable on Windows.
@@ -47,8 +53,8 @@ def train(args: argparse.Namespace) -> Path:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    vec_env = build_vec_env(args.n_envs, args.seed)
-    eval_env = build_vec_env(1, args.seed + 1)
+    vec_env = build_vec_env(args.n_envs, args.seed, no_wind=args.no_wind, action_mode=args.action_mode)
+    eval_env = build_vec_env(1, args.seed + 1, no_wind=args.no_wind, action_mode=args.action_mode)
 
     model = PPO(
         "MlpPolicy",
@@ -159,6 +165,13 @@ def main() -> None:
     parser.add_argument("--episodes", type=int, default=5, help="Eval episode count")
     parser.add_argument("--tensorboard", action="store_true")
     parser.add_argument("--progress-bar", action="store_true", help="Requires tqdm and rich")
+    parser.add_argument("--no-wind", action="store_true", help="Disable per-episode random wind")
+    parser.add_argument(
+        "--action-mode",
+        choices=("motors", "mixer"),
+        default="motors",
+        help="motors = 4 thrusts; mixer = thrust+attitude mix (easier)",
+    )
     args = parser.parse_args()
 
     if args.smoke:
