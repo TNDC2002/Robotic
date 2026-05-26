@@ -70,7 +70,7 @@ python -c "import sys; print('executable', sys.executable)"
 
 TRAIN_CMD=(
   python train_nav_rl.py
-  --timesteps 4000000
+  --timesteps 4000000000
   --n-envs 8
   --n-steps 1024
   --batch-size 512
