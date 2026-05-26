@@ -106,10 +106,14 @@ class QuadNavEnv(QuadHoverEnv):
         self._goal_marker: int | None = None
         self._episode_rng = np.random.default_rng()
 
+    def _wind_in_observation(self) -> bool:
+        if self.nav.wind_randomization.enabled:
+            return True
+        return bool(self.cfg.wind.enabled and self.cfg.wind.include_in_obs)
+
     @property
     def observation_size(self) -> int:
-        extra = 3 if self.cfg.wind.enabled and self.cfg.wind.include_in_obs else 0
-        return 18 + extra
+        return 18 + (3 if self._wind_in_observation() else 0)
 
     def _sample_episode_wind(self) -> WindConfig:
         """Random wind each episode (strength similar to aggressive demo CLI)."""
@@ -246,7 +250,7 @@ class QuadNavEnv(QuadHoverEnv):
             self._spawn_pos[1],
             self._goal_pos[0],
         ]
-        if self.cfg.wind.enabled and self.cfg.wind.include_in_obs:
+        if self._wind_in_observation() and self.cfg.wind.enabled:
             wx, wy, wz = self._wind_velocity_world(self._step_count * DT)
             obs.extend([wx, wy, wz])
         return np.array(obs, dtype=np.float32)
