@@ -71,12 +71,15 @@ class NavEnvConfig(EnvConfig):
     max_episode_steps: int = 14_400  # physics steps ≈ 60 s at 240 Hz
     action_mode: Literal["motors", "mixer"] = "motors"
     wind_randomization: NavWindRandomizationConfig = field(default_factory=NavWindRandomizationConfig)
+    # Allow high authority under chaotic wind while still requiring control.
+    # Per-motor thrust is clipped to MASS * g * max_motor_scale (Newtons).
+    max_motor_scale: float = 1.20
     # mixer mode only (action in [-1, 1])
     thrust_delta_scale: float = 0.35
     attitude_mix_scale: float = 0.85
     yaw_mix_scale: float = 0.35
     # motors mode: thrust_i = hover_per_motor * (1 + motor_span * a_i), clipped to [0, max_motor]
-    motor_hover_span: float = 0.85
+    motor_hover_span: float = 3.2
     # Rewards
     w_progress: float = 8.0
     w_goal_dist: float = 0.4
