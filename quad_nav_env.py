@@ -23,8 +23,30 @@ from typing import Any, Literal
 import numpy as np
 import pybullet as p
 
-from quad_drone_sim import HOVER_Z, MASS, allocate_motor_thrusts, scale_vec
+from quad_drone_sim import HOVER_Z, MASS, allocate_motor_thrusts
 from quad_hover_env import DT, EnvConfig, QuadHoverEnv, WindConfig
+
+
+def action_to_motor_thrust_n(
+    action: float,
+    thrust_min_n: float,
+    thrust_max_n: float,
+) -> float:
+    """Linear map action in [-1, 1] to per-motor thrust in [thrust_min_n, thrust_max_n] (N).
+
+    Equal sensitivity across the action range, e.g. for 0–4 N:
+      -1 → 0 N, -0.5 → 1 N, 0 → 2 N, 0.5 → 3 N, 1 → 4 N.
+    """
+    a = max(-1.0, min(1.0, float(action)))
+    return thrust_min_n + (thrust_max_n - thrust_min_n) * (a + 1.0) * 0.5
+
+
+def sync_max_motor_scale(cfg: "NavEnvConfig") -> None:
+    """Ensure per-motor physics cap is at least ``motor_thrust_max``."""
+    mg = MASS * 9.81
+    required_scale = cfg.motor_thrust_max / mg
+    if cfg.max_motor_scale < required_scale:
+        cfg.max_motor_scale = required_scale
 
 
 @dataclass
@@ -48,13 +70,16 @@ class NavWindRandomizationConfig:
     speed_range: tuple[float, float] = (0.5, 2.5)  # m/s, random horizontal direction
     drag_range: tuple[float, float] = (0.35, 0.75)
     quad_drag_range: tuple[float, float] = (0.03, 0.08)
-    # Multiplier on base turbulence (0.4, 0.4, 0.3); 20 ≈ demo --wind-turbulence 20
-    turbulence_scale_range: tuple[float, float] = (4.0, 22.0)
-    force_noise_range: tuple[float, float] = (0.2, 4.0)
-    corner_noise_range: tuple[float, float] = (0.06, 0.35)
-    torque_noise_range: tuple[float, float] = (0.03, 0.15)
-    gust_amplitude_range: tuple[float, float] = (0.0, 1.0)
-    base_turbulence_std: tuple[float, float, float] = (0.4, 0.4, 0.3)
+    # Multiplier on base turbulence; keep Z base low in base_turbulence_std.
+    turbulence_scale_range: tuple[float, float] = (2.0, 10.0)
+    force_noise_range: tuple[float, float] = (0.08, 0.5)
+    corner_noise_range: tuple[float, float] = (0.04, 0.15)
+    torque_noise_range: tuple[float, float] = (0.03, 0.12)
+    gust_amplitude_range: tuple[float, float] = (0.0, 0.5)
+    base_turbulence_std: tuple[float, float, float] = (0.4, 0.4, 0.06)
+    vertical_gust_coupling: float = 0.10
+    force_noise_z_scale: float = 0.20
+    corner_force_noise_z_scale: float = 0.20
 
 
 @dataclass
@@ -73,13 +98,14 @@ class NavEnvConfig(EnvConfig):
     wind_randomization: NavWindRandomizationConfig = field(default_factory=NavWindRandomizationConfig)
     # Allow high authority under chaotic wind while still requiring control.
     # Per-motor thrust is clipped to MASS * g * max_motor_scale (Newtons).
-    max_motor_scale: float = 1.20
+    max_motor_scale: float = 2.0
     # mixer mode only (action in [-1, 1])
     thrust_delta_scale: float = 0.35
     attitude_mix_scale: float = 0.85
     yaw_mix_scale: float = 0.35
-    # motors mode: thrust_i = hover_per_motor * (1 + motor_span * a_i), clipped to [0, max_motor]
-    motor_hover_span: float = 3.2
+    # motors mode: linear map action in [-1, 1] -> thrust in [motor_thrust_min, motor_thrust_max]
+    motor_thrust_min: float = 0.0   # action = -1
+    motor_thrust_max: float = 8.0   # action = +1  (action = 0 -> midpoint 4 N)
     # Rewards
     w_progress: float = 8.0
     w_goal_dist: float = 0.4
@@ -108,6 +134,10 @@ class QuadNavEnv(QuadHoverEnv):
         self._prev_action = np.zeros(4, dtype=np.float64)
         self._goal_marker: int | None = None
         self._episode_rng = np.random.default_rng()
+
+    def connect(self) -> None:
+        sync_max_motor_scale(self.nav)
+        super().connect()
 
     def _wind_in_observation(self) -> bool:
         if self.nav.wind_randomization.enabled:
@@ -149,6 +179,9 @@ class QuadNavEnv(QuadHoverEnv):
             corner_force_noise_std=float(self._episode_rng.uniform(*wr.corner_noise_range)),
             torque_noise_std=float(self._episode_rng.uniform(*wr.torque_noise_range)),
             gust_amplitude=float(self._episode_rng.uniform(*wr.gust_amplitude_range)),
+            vertical_gust_coupling=wr.vertical_gust_coupling,
+            force_noise_z_scale=wr.force_noise_z_scale,
+            corner_force_noise_z_scale=wr.corner_force_noise_z_scale,
             include_in_obs=True,
             seed=int(self._episode_rng.integers(0, 2**31 - 1)),
         )
@@ -213,6 +246,7 @@ class QuadNavEnv(QuadHoverEnv):
         self._wind_rng = random.Random(self.cfg.wind.seed)
         spawn = pos if pos is not None else self._spawn_pos
         state = super().reset(pos=spawn, orn=orn)
+        self._clear_force_visualization()
         self._update_goal_marker()
         self._start_goal_dist = self._goal_distance(state.pos)
         self._prev_goal_dist = self._start_goal_dist
@@ -254,7 +288,7 @@ class QuadNavEnv(QuadHoverEnv):
             self._goal_pos[0],
         ]
         if self._wind_in_observation() and self.cfg.wind.enabled:
-            wx, wy, wz = self._wind_velocity_world(self._step_count * DT)
+            wx, wy, wz = self._effective_wind_velocity(self._step_count * DT)
             obs.extend([wx, wy, wz])
         return np.array(obs, dtype=np.float32)
 
@@ -284,14 +318,18 @@ class QuadNavEnv(QuadHoverEnv):
     def _decode_action_motors(self, action: np.ndarray) -> list[float]:
         """Map 4D policy output to per-rotor thrust (N).
 
+        Linear, equal sensitivity over [-1, 1]:
+          thrust_N = min + (max - min) * (action + 1) / 2
+          e.g. min=0, max=4: -1→0 N, -0.5→1 N, 0→2 N, 0.5→3 N, 1→4 N
+
         Motor order matches ``signs_xy`` / corner layout:
           0 = +X +Y, 1 = +X -Y, 2 = -X +Y, 3 = -X -Y (body frame).
         """
         a = np.clip(action, -1.0, 1.0)
-        hover = MASS * 9.81 / 4.0
-        span = self.nav.motor_hover_span
+        t_min = self.nav.motor_thrust_min
+        t_max = self.nav.motor_thrust_max
         return [
-            float(min(self._max_motor, max(0.0, hover * (1.0 + span * a[i]))))
+            float(min(self._max_motor, action_to_motor_thrust_n(a[i], t_min, t_max)))
             for i in range(4)
         ]
 
@@ -301,23 +339,22 @@ class QuadNavEnv(QuadHoverEnv):
             return self._decode_action_motors(arr)
         return self._decode_action_mixer(arr)
 
-    def _apply_forces(self, action: list[float] | tuple[float, ...] | None) -> None:
+    def _apply_forces(
+        self,
+        action: list[float] | tuple[float, ...] | None,
+        *,
+        update_viz: bool = True,
+    ) -> None:
         assert self._drone is not None
         if action is None:
             raise ValueError("QuadNavEnv requires an RL action each step")
         thrusts = self._decode_action(action)  # type: ignore[arg-type]
         pos, orn = p.getBasePositionAndOrientation(self._drone)
         lin_vel, _ = p.getBaseVelocity(self._drone)
-        from quad_hover_env import body_z_in_world
-
-        thrust_dir = body_z_in_world(orn)
-        from quad_hover_env import world_from_body
-
-        for corner_body, thrust in zip(self._corners_body, thrusts):
-            world_point = world_from_body(pos, orn, corner_body)
-            force = scale_vec(thrust_dir, thrust)
-            p.applyExternalForce(self._drone, -1, force, world_point, p.WORLD_FRAME)
+        self._apply_motor_thrusts(pos, orn, thrusts)
         self._apply_wind(pos, orn, lin_vel)
+        if update_viz:
+            self._update_force_visualization(pos, pos, orn, lin_vel)
 
     def _compute_nav_reward(
         self,
@@ -368,14 +405,11 @@ class QuadNavEnv(QuadHoverEnv):
         total_reward = 0.0
         last_parts: dict[str, float] = {}
 
-        for _ in range(max(1, self.nav.frame_skip)):
-            self._apply_forces(action_arr)
+        for sub_i in range(max(1, self.nav.frame_skip)):
+            last_sub = sub_i == max(1, self.nav.frame_skip) - 1
+            self._apply_forces(action_arr, update_viz=last_sub)
             p.stepSimulation()
             self._step_count += 1
-            if self.cfg.step_sleep_s > 0.0:
-                import time
-
-                time.sleep(self.cfg.step_sleep_s)
 
             pos, orn = p.getBasePositionAndOrientation(self._drone)
             lin_vel, ang_vel = p.getBaseVelocity(self._drone)
@@ -396,6 +430,11 @@ class QuadNavEnv(QuadHoverEnv):
             total_reward += step_reward
             if done:
                 break
+
+        if self.cfg.step_sleep_s > 0.0:
+            import time
+
+            time.sleep(self.cfg.step_sleep_s)
 
         self._prev_action = action_arr.copy()
         obs = self.observation_vector_from_physics()
@@ -452,8 +491,17 @@ def make_nav_env(
     wind: WindConfig | None = None,
     seed: int | None = None,
     step_sleep_s: float = 0.0,
+    motor_thrust_min: float | None = None,
+    motor_thrust_max: float | None = None,
 ) -> QuadNavEnv:
-    cfg = NavEnvConfig(gui=gui, step_sleep_s=step_sleep_s)
+    from env_config import build_nav_env_config
+
+    cfg = build_nav_env_config(
+        gui=gui,
+        step_sleep_s=step_sleep_s,
+        motor_thrust_min=motor_thrust_min,
+        motor_thrust_max=motor_thrust_max,
+    )
     if wind is not None:
         cfg.wind = wind
     env = QuadNavEnv(cfg)

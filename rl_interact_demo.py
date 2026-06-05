@@ -100,15 +100,19 @@ def run_episode(
     disturb_at: int | None,
     step_sleep_s: float,
     wind: WindConfig | None,
+    hover_balance: bool = False,
 ) -> None:
-    cfg = EnvConfig(gui=gui, step_sleep_s=step_sleep_s)
-    if wind is not None:
-        cfg.wind = wind
-    if episode_seconds is not None:
-        cfg.max_episode_steps = episode_steps_for_seconds(episode_seconds)
-    elif max_steps is not None:
+    from env_config import build_hover_env_config, hover_thrust_per_motor_n
+
+    cfg = build_hover_env_config(
+        gui=gui,
+        step_sleep_s=step_sleep_s,
+        hover_balance=hover_balance,
+        wind=wind,
+        episode_seconds=episode_seconds,
+    )
+    if max_steps is not None:
         cfg.max_episode_steps = max_steps
-    # else: keep EnvConfig.max_episode_steps default from quad_hover_env.py
 
     horizon = cfg.max_episode_steps
     env = QuadHoverEnv(cfg)
@@ -128,9 +132,16 @@ def run_episode(
     else:
         print("  Wind: off")
     print(f"  Task: hold near target {cfg.target_xy + (cfg.target_z,)} and avoid flip/crash")
+    if cfg.hover_balance_thrust:
+        t = hover_thrust_per_motor_n()
+        print(
+            f"  Mode: HOVER BALANCE — fixed {t:.3f} N/motor ({4 * t:.3f} N total ≈ m·g), "
+            "no autopilot; watch wind push the drone"
+        )
+    else:
+        print(f"  Action: None each step -> built-in hover autopilot (placeholder for your policy)")
     print(f"  Observation size: {env.observation_size} floats")
-    print(f"  Action: None each step -> built-in hover autopilot (placeholder for your policy)")
-    if disturb_at is not None:
+    if disturb_at is not None and not cfg.hover_balance_thrust:
         print(f"  Disturbance at step {disturb_at}: random motor thrust for 30 frames")
     print()
 
@@ -145,8 +156,12 @@ def run_episode(
 
     for _ in range(horizon):
         action = None
-        if disturb_at is not None and env.episode_step >= disturb_at and disturb_left < 30:
-            # Simulate a bad policy briefly so reward/termination are visible.
+        if (
+            not cfg.hover_balance_thrust
+            and disturb_at is not None
+            and env.episode_step >= disturb_at
+            and disturb_left < 30
+        ):
             action = [0.3, 0.3, 2.0, 2.0]
             disturb_left += 1
 
@@ -219,6 +234,11 @@ def main() -> None:
         help="No frame sleep (overrides --sleep / --gui default)",
     )
     parser.add_argument(
+        "--hover-balance",
+        action="store_true",
+        help="Fixed m·g/4 thrust per motor (wind-tunnel mode); overrides autopilot",
+    )
+    parser.add_argument(
         "--wind",
         nargs=3,
         type=float,
@@ -265,35 +285,45 @@ def main() -> None:
     if args.fast and args.realtime:
         parser.error("Use only one of --fast or --realtime")
 
-    if args.fast:
-        step_sleep_s = 0.0
-    elif args.realtime:
-        step_sleep_s = REALTIME_STEP_SLEEP_S
-    elif args.sleep is not None:
-        step_sleep_s = max(0.0, args.sleep)
-    elif args.gui:
-        step_sleep_s = GUI_STEP_SLEEP_S
-    else:
-        step_sleep_s = 0.0
+    from env_config import load_wind_config, resolve_gui_step_sleep_s
 
-    wind_cfg = None
+    step_sleep_s = resolve_gui_step_sleep_s(
+        gui=args.gui,
+        sleep=args.sleep,
+        realtime=args.realtime,
+        fast=args.fast,
+        frame_skip=1,
+    )
+
+    wind_cfg = load_wind_config()
     if args.wind is not None:
-        turb_scale = 1.0 if args.wind_turbulence is None else max(0.0, args.wind_turbulence)
-        base_turb = (0.4, 0.4, 0.3)
-        if args.wind_turbulence == 0.0:
-            turb = (0.0, 0.0, 0.0)
-        else:
-            turb = tuple(turb_scale * t for t in base_turb)
-        wind_cfg = WindConfig(
+        wind_cfg = load_wind_config(
             enabled=True,
             velocity=(args.wind[0], args.wind[1], args.wind[2]),
-            drag_coeff=args.wind_drag,
-            gust_amplitude=args.gust,
-            turbulence_std=turb,
-            seed=args.wind_seed,
         )
+        wind_cfg.drag_coeff = args.wind_drag
+        wind_cfg.gust_amplitude = args.gust
+        if args.wind_turbulence is not None:
+            turb_scale = max(0.0, args.wind_turbulence)
+            if turb_scale == 0.0:
+                wind_cfg.turbulence_std = (0.0, 0.0, 0.0)
+            else:
+                wind_cfg.turbulence_std = tuple(turb_scale * t for t in (0.4, 0.4, 0.06))
         if args.wind_noise is not None:
             wind_cfg.force_noise_std = args.wind_noise
+        if args.wind_seed is not None:
+            wind_cfg.seed = args.wind_seed
+    elif not wind_cfg.enabled and args.wind_turbulence is not None:
+        wind_cfg.enabled = True
+        turb_scale = max(0.0, args.wind_turbulence)
+        wind_cfg.turbulence_std = (0.0, 0.0, 0.0) if turb_scale == 0.0 else tuple(
+            turb_scale * t for t in (0.4, 0.4, 0.06)
+        )
+
+    hover_balance = args.hover_balance
+    if not hover_balance:
+        from env_config import load_hover_balance_mode
+        hover_balance = load_hover_balance_mode()
 
     run_episode(
         gui=args.gui,
@@ -303,6 +333,7 @@ def main() -> None:
         disturb_at=args.disturb,
         step_sleep_s=step_sleep_s,
         wind=wind_cfg,
+        hover_balance=hover_balance,
     )
 
 

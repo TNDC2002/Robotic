@@ -1,143 +1,141 @@
-## Robotic Quad Navigation RL
+# Robotic Quad Navigation RL
 
-This repo trains a PPO agent to fly a quadrotor from a spawn point to a random goal using `QuadNavGymEnv` (`train_nav_rl.py`).
+PyBullet quadrotor sim with PPO navigation training (`train_nav_rl.py`), hover demo (`rl_interact_demo.py`), and configurable wind / thrust via `.env`.
 
-### Prerequisites
-
-Create/activate the project venv (already present in this repo as `.venv`):
+## Setup
 
 ```bash
-cd /home/chuongtnd/git-repo/Robotic
-source .venv/bin/activate
+cd Robotic
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+cp .env.example .env        # edit thrust, wind, GUI speed
 ```
 
-### Training (local)
+## Configuration (`.env`)
 
-Run training with default settings:
+Settings load from `.env` automatically (`env_config.py`). **CLI flags override `.env`.**
 
-```bash
-python train_nav_rl.py
+### Motor thrust (navigation RL)
+
+Linear map from policy action `[-1, 1]` to per-motor thrust (N):
+
+```text
+thrust_N = MIN + (MAX - MIN) * (action + 1) / 2
 ```
 
-Example (matches your request):
+| Variable | Example | Meaning |
+|----------|---------|---------|
+| `MOTOR_THRUST_MIN_N` | `0` | Thrust at action `-1` |
+| `MOTOR_THRUST_MAX_N` | `4` | Thrust at action `+1` |
+
+Example: `MIN=0`, `MAX=4` → `-1→0 N`, `-0.5→1 N`, `0→2 N`, `0.5→3 N`, `1→4 N`.
+
+### GUI playback
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `GUI_STEP_SLEEP_S` | `0.01` | Pause per RL step (nav eval) or physics step (hover demo) |
+| `GUI_REALTIME` | `0` | `1` = match sim clock |
+| `GUI_FAST` | `0` | `1` = no sleep (max speed) |
+
+### Fixed wind (demo / `--no-wind` training)
+
+Used by `rl_interact_demo.py` and when `WIND_RANDOMIZATION=0`.
+
+| Variable | Meaning |
+|----------|---------|
+| `WIND_ENABLED` | `1` = wind on |
+| `WIND_VX`, `WIND_VY`, `WIND_VZ` | Mean wind velocity (m/s) |
+| `WIND_DRAG`, `WIND_QUAD_DRAG` | Drag coefficients |
+| `WIND_GUST` | Sinusoidal gust amplitude (m/s) |
+| `WIND_TURBULENCE_SCALE` | Multiplier on base turbulence |
+| `WIND_TURBULENCE_BASE_X/Y/Z` | OU turbulence std (m/s) |
+| `WIND_FORCE_NOISE`, `WIND_CORNER_NOISE`, `WIND_TORQUE_NOISE` | Extra noise (N or N·m) |
+| `WIND_FORCE_NOISE_Z_SCALE`, `WIND_CORNER_NOISE_Z_SCALE` | Softer vertical noise |
+| `WIND_VERTICAL_GUST_COUPLING` | Vertical fraction of gust |
+
+See `.env.example` for the full list.
+
+### Random wind (navigation training)
+
+When `WIND_RANDOMIZATION=1` (default for training), each episode samples wind from `*_MIN` / `*_MAX` ranges (`WIND_SPEED_MIN`, `WIND_DRAG_MIN`, etc.).
+
+Training with fixed wind instead:
 
 ```bash
-python train_nav_rl.py --timesteps 4000000 --n-envs 16
+# .env: WIND_RANDOMIZATION=0 and set WIND_VX, WIND_VY, ...
+python train_nav_rl.py --no-wind   # or configure fixed WIND_* in .env
 ```
 
-### Outputs / checkpoints
+## Wind-tunnel / hover-balance mode
 
-By default training writes to:
-
-- `runs/nav_ppo/`
-- checkpoints: `runs/nav_ppo/ckpt/rl_model_<N>_steps.zip`
-- best model: `runs/nav_ppo/best/best_model.zip`
-- final model: `runs/nav_ppo/final_model.zip`
-
-### Continue training (resume from an existing checkpoint)
-
-There is **no `--resume` flag** in `train_nav_rl.py`. To continue training, you need to load the checkpoint with Stable-Baselines3, then call `learn(..., reset_num_timesteps=False)` so the timestep counter is treated as cumulative.
-
-Example: resume to `4_000_000` total timesteps from the latest checkpoint:
+Hold thrust fixed at **m·g / 4 per motor** (total = weight) so the drone floats while wind pushes it — useful to inspect force arrows and wind settings without a trained policy.
 
 ```bash
-python -c "
-from pathlib import Path
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
-from train_nav_rl import build_vec_env
+# CLI
+python rl_interact_demo.py --gui --hover-balance --seconds 60
 
-out_dir = Path('runs/nav_ppo')
-ckpt = 'runs/nav_ppo/ckpt/rl_model_100000_steps.zip'  # <-- change if you use another checkpoint
-
-n_envs = 16
-seed = 0
-no_wind = False
-action_mode = 'motors'
-
-vec_env = build_vec_env(n_envs, seed, no_wind=no_wind, action_mode=action_mode)
-eval_env = build_vec_env(1, seed + 1, no_wind=no_wind, action_mode=action_mode)
-
-model = PPO.load(ckpt, env=vec_env)
-
-callbacks = [
-  CheckpointCallback(
-    save_freq=max(50_000 // n_envs, 1),
-    save_path=str(out_dir / 'ckpt')
-  ),
-  EvalCallback(
-    eval_env,
-    best_model_save_path=str(out_dir / 'best'),
-    log_path=str(out_dir / 'eval'),
-    eval_freq=max(20_000 // n_envs, 1),
-    n_eval_episodes=5,
-    deterministic=True
-  )
-]
-
-model.learn(
-  total_timesteps=4_000_000,
-  callback=callbacks,
-  reset_num_timesteps=False,
-  progress_bar=True
-)
-
-model.save(out_dir / 'final_model')
-vec_env.close()
-eval_env.close()
-"
+# Or .env: HOVER_BALANCE_MODE=1
+python rl_interact_demo.py --gui --seconds 60
 ```
 
-Tip: make sure you use the same `--n-envs`, `--seed`, and `--action-mode` (and `--no-wind` / wind randomization) that match your earlier run as closely as possible.
+Tune wind in `.env` (`WIND_VX`, `WIND_DRAG`, turbulence, noise) and re-run. Debug arrows show drag vs thrust vs weight in **Newtons** (same scale).
 
-### Evaluation
-
-Run evaluation only (uses the default `runs/nav_ppo/best/best_model.zip`):
+## Training
 
 ```bash
-python train_nav_rl.py --eval --episodes 5
+python train_nav_rl.py --timesteps 400000 --n-envs 8 --n-steps 1024 --batch-size 512
 ```
 
-### SLURM submission
-
-This repo includes two scripts in the project root:
-
-- `submit_train_nav_rl.sh`: convenience wrapper that calls `sbatch` on the `.slurm` file
-- `submit_train_nav_rl.slurm`: the actual SLURM batch script
-
-Submit:
+Disable random wind:
 
 ```bash
-cd /home/chuongtnd/git-repo/Robotic
+python train_nav_rl.py --no-wind
+```
+
+### Outputs
+
+- `runs/nav_ppo/ckpt/` — periodic checkpoints
+- `runs/nav_ppo/best/best_model.zip` — best eval model
+- `runs/nav_ppo/final_model.zip` — model at end of training
+
+### Resume training
+
+No `--resume` flag; load a checkpoint with SB3 and `reset_num_timesteps=False` (see example in git history or SB3 docs).
+
+## Evaluation
+
+```bash
+python train_nav_rl.py --eval --gui --model runs/nav_ppo/best/best_model.zip
+python train_nav_rl.py --eval --gui --sleep 0.02 --no-viz --model runs/nav_ppo/best/best_model.zip
+```
+
+Uses `.env` for thrust range, wind randomization, and `GUI_STEP_SLEEP_S`.
+
+## Hover demo (no RL)
+
+```bash
+python rl_interact_demo.py --gui
+python rl_interact_demo.py --gui --hover-balance --seconds 120
+python rl_interact_demo.py --gui --wind 1.5 0 0    # CLI overrides WIND_VX/Y/Z
+```
+
+## SLURM
+
+```bash
 ./submit_train_nav_rl.sh
 ```
 
-The current `submit_train_nav_rl.slurm` settings in this repo are:
+Logs: `logs/slurm-<jobid>.out`, `logs/job_<jobid>.log`.
 
-- `--partition=mig`
-- `--cpus-per-task=8`
-- `--mem=96G`
-- `--time=0` (unlimited walltime on this cluster; override with `./submit_train_nav_rl.sh --time=HH:MM:SS`)
-- training command uses `--n-envs 8`, `--n-steps 1024`, `--batch-size 512`
+## Project layout
 
-If you want `16` CPU cores and `--n-envs 16`, edit `submit_train_nav_rl.slurm` accordingly.
-
-#### Debugging SLURM jobs
-
-Always submit via `./submit_train_nav_rl.sh` (it creates `logs/` before `sbatch` and uses absolute log paths).
-
-Log files:
-
-- `logs/slurm-<jobid>.out` — SLURM stdout+stderr (same file)
-- `logs/job_<jobid>.log` — per-job copy written by the batch script
-- `logs/bootstrap.log` — first lines written before `set -e` (check this if `slurm-*.out` is empty)
-
-If a job dies immediately, check scheduler state:
-
-```bash
-sacct -j <jobid> --format=JobID,State,ExitCode,Elapsed,MaxRSS,ReqMem,Reason
-```
-
-Common instant-fail causes: partition/account limits, missing `logs/` at submit time, or invalid `--time` syntax on clusters that do not accept `0` as unlimited.
-
+| File | Role |
+|------|------|
+| `quad_hover_env.py` | Hover physics, wind, force visualization |
+| `quad_nav_env.py` | Spawn → goal navigation task |
+| `train_nav_rl.py` | PPO training / eval |
+| `rl_interact_demo.py` | Readable hover / wind-tunnel demo |
+| `env_config.py` | `.env` loader |
+| `.env` | Local config (gitignored) |

@@ -60,14 +60,24 @@ class WindConfig:
     quad_drag_coeff: float = 0.04  # extra |v|·v drag per axis (N·s²/m²); stronger in gusts
     gust_amplitude: float = 0.0  # sinusoidal gust magnitude on wind.x (m/s)
     gust_freq_hz: float = 0.15
+    vertical_gust_coupling: float = 0.12  # fraction of gust added to vertical wind (was hardcoded 0.35)
     # Smoothed 3D turbulence (Ornstein–Uhlenbeck); affects X, Y, and Z wind components.
-    turbulence_std: tuple[float, float, float] = (0.4, 0.4, 0.3)
+    turbulence_std: tuple[float, float, float] = (0.4, 0.4, 0.08)
     turbulence_tau_s: float = 0.3  # correlation time; lower = jerkier gusts
     force_noise_std: float = 0.12  # extra random force (N) per axis on total drag
+    force_noise_z_scale: float = 0.25  # multiplier on vertical force noise (lower = less altitude spam)
     corner_force_noise_std: float = 0.08  # random force (N) per axis at each motor corner
+    corner_force_noise_z_scale: float = 0.25
     torque_noise_std: float = 0.04  # random torque (N·m) per axis
     seed: int | None = None  # None = nondeterministic turbulence
     include_in_obs: bool = True  # append effective wind_xyz to observation when enabled
+    # GUI debug arrows (PyBullet addUserDebugLine); enable via EnvConfig.show_wind_visualization.
+    visualize: bool = False
+    viz_grid_half_extent: float = 1.0  # draw a small drag field grid around the drone
+    viz_grid_spacing: float = 1.0
+    viz_update_stride: int = 8  # refresh arrows every N physics steps (GUI only)
+    viz_show_applied_drag: bool = False  # include noisy applied drag (flickers; off by default)
+    viz_show_weight: bool = True  # purple arrow = weight (N), for thrust comparison
 
 
 @dataclass
@@ -84,6 +94,13 @@ class EnvConfig:
     gui: bool = False
     # Wall-clock pause after each stepSimulation (0 = as fast as possible).
     step_sleep_s: float = 0.0
+    show_wind_visualization: bool = True  # drag-force arrows in GUI when wind is enabled
+    show_thrust_visualization: bool = True  # green thrust arrows at each motor in GUI
+    # Shared scale for all force arrows (N): same length per Newton for drag, thrust, weight.
+    force_viz_length_per_n: float = 0.12
+    force_viz_min_length: float = 0.04
+    force_viz_max_length: float = 1.2
+    force_viz_update_stride: int = 1
     wind: WindConfig = field(default_factory=WindConfig)
     # PD hover controller (used when action is None)
     kp_z: float = 18.0
@@ -91,6 +108,8 @@ class EnvConfig:
     kp_rp: float = 0.45
     kd_rp: float = 0.08
     max_motor_scale: float = 0.65  # fraction of mg per motor cap
+    # Fixed mg/4 per motor (no PD / no RL action) — wind-tunnel visualization mode.
+    hover_balance_thrust: bool = False
     # Reward weights
     w_alive: float = 0.05
     w_pos_xy: float = 1.0
@@ -218,6 +237,348 @@ class QuadHoverEnv:
         self._last_wind_info: dict[str, Any] | None = None
         self._wind_turbulence = (0.0, 0.0, 0.0)
         self._wind_rng = random.Random(self.cfg.wind.seed)
+        self._force_viz_line_ids: list[int] = []
+        self._force_viz_text_id: int = -1
+        self._last_thrusts: list[float] = [0.0, 0.0, 0.0, 0.0]
+        self._last_thrust_dir: tuple[float, float, float] = (0.0, 0.0, 1.0)
+
+    def _sync_wind_visualize_flag(self) -> None:
+        self.cfg.wind.visualize = bool(
+            self.cfg.gui and self.cfg.wind.enabled and self.cfg.show_wind_visualization
+        )
+
+    @staticmethod
+    def _force_magnitude_color(force_n: float, ref_n: float = 10.0) -> list[float]:
+        """Map force magnitude (N) to RGB for debug lines."""
+        t = max(0.0, min(1.0, force_n / max(1e-6, ref_n)))
+        return [t, 0.45 + 0.4 * (1.0 - t), 1.0 - t]
+
+    @staticmethod
+    def _force_viz_scale(cfg: EnvConfig) -> tuple[float, float, float]:
+        return (cfg.force_viz_length_per_n, cfg.force_viz_min_length, cfg.force_viz_max_length)
+
+    @staticmethod
+    def _vec_add(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+        return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+    @staticmethod
+    def _vec_scale(v: tuple[float, float, float], s: float) -> tuple[float, float, float]:
+        return (v[0] * s, v[1] * s, v[2] * s)
+
+    @staticmethod
+    def _vec_unit(v: tuple[float, float, float]) -> tuple[float, float, float]:
+        n = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+        if n <= 1e-9:
+            return (1.0, 0.0, 0.0)
+        return (v[0] / n, v[1] / n, v[2] / n)
+
+    @staticmethod
+    def _vec_cross(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
+        return (
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        )
+
+    def _clear_debug_lines(self, line_ids: list[int]) -> None:
+        if self._client is None or not p.isConnected(self._client):
+            line_ids.clear()
+            return
+        for uid in line_ids:
+            try:
+                p.removeUserDebugItem(uid)
+            except Exception:
+                pass
+        line_ids.clear()
+
+    def _clear_force_visualization(self) -> None:
+        if self._client is not None and p.isConnected(self._client):
+            try:
+                p.removeAllUserDebugItems()
+            except Exception:
+                self._clear_debug_lines(self._force_viz_line_ids)
+        else:
+            self._force_viz_line_ids.clear()
+        self._force_viz_line_ids.clear()
+        self._force_viz_text_id = -1
+
+    def _clear_wind_visualization(self) -> None:
+        self._clear_force_visualization()
+
+    def _clear_thrust_visualization(self) -> None:
+        pass
+
+    def _replace_debug_line(
+        self,
+        line_ids: list[int],
+        idx: int,
+        start: tuple[float, float, float],
+        end: tuple[float, float, float],
+        color: list[float],
+        width: float = 2.0,
+    ) -> None:
+        replace_id = line_ids[idx] if idx < len(line_ids) else -1
+        uid = p.addUserDebugLine(start, end, color, lineWidth=width, replaceItemUniqueId=replace_id)
+        if idx < len(line_ids):
+            line_ids[idx] = uid
+        else:
+            line_ids.append(uid)
+
+    def _draw_force_arrow(
+        self,
+        line_ids: list[int],
+        idx: int,
+        origin: tuple[float, float, float],
+        force: tuple[float, float, float],
+        *,
+        color: list[float],
+        length_per_n: float,
+        min_length: float,
+        max_length: float,
+        width: float = 2.5,
+        draw_head: bool = True,
+    ) -> int:
+        magnitude = math.sqrt(force[0] ** 2 + force[1] ** 2 + force[2] ** 2)
+        if magnitude <= 1e-4:
+            calm_end = (origin[0], origin[1], origin[2] + min_length * 0.5)
+            self._replace_debug_line(line_ids, idx, origin, calm_end, [0.35, 0.35, 0.35], width=1.2)
+            return idx + 1
+
+        direction = self._vec_unit(force)
+        length = max(min_length, min(max_length, magnitude * length_per_n))
+        tip = self._vec_add(origin, self._vec_scale(direction, length))
+        self._replace_debug_line(line_ids, idx, origin, tip, color, width=width)
+        idx += 1
+
+        if not draw_head:
+            return idx
+
+        ref = (0.0, 0.0, 1.0) if abs(direction[2]) < 0.9 else (1.0, 0.0, 0.0)
+        side = self._vec_unit(self._vec_cross(direction, ref))
+        head_back = self._vec_scale(direction, -0.22 * length)
+        head_side = self._vec_scale(side, 0.12 * length)
+        self._replace_debug_line(
+            line_ids,
+            idx,
+            tip,
+            self._vec_add(self._vec_add(tip, head_back), head_side),
+            color,
+            width=width - 0.5,
+        )
+        idx += 1
+        self._replace_debug_line(
+            line_ids,
+            idx,
+            tip,
+            self._vec_add(self._vec_add(tip, head_back), self._vec_scale(head_side, -1.0)),
+            color,
+            width=width - 0.5,
+        )
+        return idx + 1
+
+    def _drag_force_vector(
+        self,
+        rel: tuple[float, float, float],
+        *,
+        k_lin: float | None = None,
+        k_quad: float | None = None,
+    ) -> tuple[float, float, float]:
+        wcfg = self.cfg.wind
+        k_lin = wcfg.drag_coeff if k_lin is None else k_lin
+        k_quad = wcfg.quad_drag_coeff if k_quad is None else k_quad
+        return tuple(self._drag_force_axis(rel[i], k_lin, k_quad) for i in range(3))
+
+    @staticmethod
+    def _force_magnitude(force: tuple[float, float, float]) -> float:
+        return math.sqrt(force[0] ** 2 + force[1] ** 2 + force[2] ** 2)
+
+    def _update_force_visualization(
+        self,
+        anchor: tuple[float, float, float],
+        pos: tuple[float, float, float],
+        orn: tuple[float, float, float, float],
+        lin_vel: tuple[float, float, float],
+    ) -> None:
+        """Draw drag, thrust, and weight arrows on one Newton scale."""
+        show_wind = self.cfg.wind.enabled and self.cfg.show_wind_visualization and self.cfg.wind.visualize
+        show_thrust = self.cfg.show_thrust_visualization
+        if not self.cfg.gui or (not show_wind and not show_thrust):
+            return
+        if self._client is None or not p.isConnected(self._client):
+            return
+        stride = max(1, self.cfg.force_viz_update_stride)
+        if self._step_count % stride != 0:
+            return
+
+        line_ids = self._force_viz_line_ids
+        idx = 0
+        length_per_n, min_len, max_len = self._force_viz_scale(self.cfg)
+        drone_origin = (anchor[0], anchor[1], anchor[2] + 0.35)
+        label_parts: list[str] = []
+
+        if show_wind and self._last_wind_info is not None:
+            wcfg = self.cfg.wind
+            mean_wind = self._last_wind_info["mean_velocity"]
+            rel_mean = (
+                mean_wind[0] - lin_vel[0],
+                mean_wind[1] - lin_vel[1],
+                mean_wind[2] - lin_vel[2],
+            )
+            rel_eff = self._last_wind_info["relative_air_velocity"]
+            mean_drag = self._drag_force_vector(rel_mean)
+            eff_drag = self._drag_force_vector(rel_eff)
+            applied_drag = self._last_wind_info["force"]
+
+            idx = self._draw_force_arrow(
+                line_ids,
+                idx,
+                drone_origin,
+                mean_drag,
+                color=[0.15, 0.75, 1.0],
+                length_per_n=length_per_n,
+                min_length=min_len,
+                max_length=max_len,
+                width=2.2,
+            )
+            eff_mag = self._force_magnitude(eff_drag)
+            idx = self._draw_force_arrow(
+                line_ids,
+                idx,
+                (drone_origin[0], drone_origin[1], drone_origin[2] + 0.08),
+                eff_drag,
+                color=self._force_magnitude_color(eff_mag),
+                length_per_n=length_per_n,
+                min_length=min_len,
+                max_length=max_len,
+                width=2.8,
+            )
+            if wcfg.viz_show_applied_drag:
+                applied_mag = self._force_magnitude(applied_drag)
+                idx = self._draw_force_arrow(
+                    line_ids,
+                    idx,
+                    (drone_origin[0], drone_origin[1], drone_origin[2] - 0.08),
+                    applied_drag,
+                    color=[0.95, 0.55, 0.15],
+                    length_per_n=length_per_n,
+                    min_length=min_len,
+                    max_length=max_len,
+                    width=2.0,
+                )
+                label_parts.append(f"drag(appl) {applied_mag:.2f} N")
+
+            half = wcfg.viz_grid_half_extent
+            spacing = max(0.25, wcfg.viz_grid_spacing)
+            z = anchor[2] + 0.15
+            gx = int(round((2 * half) / spacing))
+            for ix in range(gx + 1):
+                for iy in range(gx + 1):
+                    ox = anchor[0] - half + ix * spacing
+                    oy = anchor[1] - half + iy * spacing
+                    idx = self._draw_force_arrow(
+                        line_ids,
+                        idx,
+                        (ox, oy, z),
+                        mean_drag,
+                        color=[0.15, 0.75, 1.0],
+                        length_per_n=length_per_n,
+                        min_length=min_len,
+                        max_length=max_len,
+                        width=1.5,
+                        draw_head=False,
+                    )
+
+            label_parts.append(f"drag(mean) {self._force_magnitude(mean_drag):.2f} N")
+            label_parts.append(f"drag(eff) {eff_mag:.2f} N")
+
+        if show_thrust:
+            thrust_dir = self._last_thrust_dir
+            thrusts = self._last_thrusts
+            total_thrust_n = sum(thrusts)
+            total_force = scale_vec(thrust_dir, total_thrust_n)
+            thrust_anchor = (
+                (drone_origin[0] + 0.14, drone_origin[1], drone_origin[2])
+                if show_wind and self._last_wind_info is not None
+                else drone_origin
+            )
+            idx = self._draw_force_arrow(
+                line_ids,
+                idx,
+                thrust_anchor,
+                total_force,
+                color=[0.05, 0.95, 0.15],
+                length_per_n=length_per_n,
+                min_length=min_len,
+                max_length=max_len,
+                width=3.2,
+            )
+            max_thrust = max(1e-6, self._max_motor)
+            for corner_body, thrust in zip(self._corners_body, thrusts):
+                origin = world_from_body(pos, orn, corner_body)
+                force = scale_vec(thrust_dir, thrust)
+                t = max(0.0, min(1.0, thrust / max_thrust))
+                color = [0.08 + 0.55 * t, 0.75 + 0.2 * t, 0.08]
+                idx = self._draw_force_arrow(
+                    line_ids,
+                    idx,
+                    origin,
+                    force,
+                    color=color,
+                    length_per_n=length_per_n,
+                    min_length=min_len,
+                    max_length=max_len,
+                    width=2.0,
+                )
+            label_parts.append(f"thrust Σ {total_thrust_n:.2f} N")
+
+        if (show_thrust or show_wind) and self.cfg.wind.viz_show_weight:
+            weight = (0.0, 0.0, -MASS * 9.81)
+            idx = self._draw_force_arrow(
+                line_ids,
+                idx,
+                (drone_origin[0] + 0.12, drone_origin[1], drone_origin[2]),
+                weight,
+                color=[0.65, 0.35, 0.95],
+                length_per_n=length_per_n,
+                min_length=min_len,
+                max_length=max_len,
+                width=2.0,
+            )
+            label_parts.append(f"weight {MASS * 9.81:.2f} N")
+
+        if not label_parts:
+            label = "force viz (N)"
+        else:
+            label = "  ".join(label_parts)
+        text_pos = (anchor[0], anchor[1], anchor[2] + 0.55)
+        self._force_viz_text_id = p.addUserDebugText(
+            label,
+            textPosition=text_pos,
+            textColorRGB=[1.0, 1.0, 1.0],
+            textSize=1.2,
+            replaceItemUniqueId=self._force_viz_text_id,
+        )
+
+        while len(line_ids) > idx:
+            try:
+                p.removeUserDebugItem(line_ids.pop())
+            except Exception:
+                pass
+
+    def _apply_motor_thrusts(
+        self,
+        pos: tuple[float, float, float],
+        orn: tuple[float, float, float, float],
+        thrusts: list[float],
+    ) -> None:
+        assert self._drone is not None
+        thrust_dir = body_z_in_world(orn)
+        for corner_body, thrust in zip(self._corners_body, thrusts):
+            world_point = world_from_body(pos, orn, corner_body)
+            force = scale_vec(thrust_dir, thrust)
+            p.applyExternalForce(self._drone, -1, force, world_point, p.WORLD_FRAME)
+        self._last_thrusts = list(thrusts)
+        self._last_thrust_dir = thrust_dir
 
     @property
     def episode_step(self) -> int:
@@ -256,6 +617,7 @@ class QuadHoverEnv:
         self._spawn_drone()
 
     def close(self) -> None:
+        self._clear_force_visualization()
         if self._client is not None and p.isConnected(self._client):
             p.disconnect(self._client)
         self._client = None
@@ -300,6 +662,8 @@ class QuadHoverEnv:
         self._pitch_trim = 0.0
         self._wind_turbulence = (0.0, 0.0, 0.0)
         self._wind_rng = random.Random(self.cfg.wind.seed)
+        self._sync_wind_visualize_flag()
+        self._clear_force_visualization()
         return self._read_state()
 
     def step(
@@ -348,7 +712,7 @@ class QuadHoverEnv:
 
         wind_obs = None
         if self.cfg.wind.enabled and self.cfg.wind.include_in_obs:
-            wind_obs = self._wind_velocity_world(self._step_count * DT)
+            wind_obs = self._effective_wind_velocity(self._step_count * DT)
 
         return DroneState(
             step=self._step_count,
@@ -380,18 +744,26 @@ class QuadHoverEnv:
             for i in range(3)
         )
 
-    def _wind_velocity_world(self, sim_time_s: float) -> tuple[float, float, float]:
-        """Mean + gust + turbulent component (full 3D)."""
+    def _mean_wind_velocity(self, sim_time_s: float) -> tuple[float, float, float]:
+        """Episode mean wind + sinusoidal gust (no turbulence)."""
         w = self.cfg.wind
-        self._update_wind_turbulence()
         wx, wy, wz = w.velocity
         if w.gust_amplitude:
             gust = w.gust_amplitude * math.sin(2.0 * math.pi * w.gust_freq_hz * sim_time_s)
             wx += gust
-            # Couple a fraction of gust into vertical component (updraft/downdraft).
-            wz += 0.35 * gust
+            wz += w.vertical_gust_coupling * gust
+        return (wx, wy, wz)
+
+    def _effective_wind_velocity(self, sim_time_s: float) -> tuple[float, float, float]:
+        """Mean + gust + current turbulence sample (what physics/obs use)."""
+        mx, my, mz = self._mean_wind_velocity(sim_time_s)
         tx, ty, tz = self._wind_turbulence
-        return (wx + tx, wy + ty, wz + tz)
+        return (mx + tx, my + ty, mz + tz)
+
+    def _wind_velocity_world(self, sim_time_s: float) -> tuple[float, float, float]:
+        """Mean + gust + turbulent component (full 3D). Updates turbulence once."""
+        self._update_wind_turbulence()
+        return self._effective_wind_velocity(sim_time_s)
 
     @staticmethod
     def _drag_force_axis(rel: float, k_lin: float, k_quad: float) -> float:
@@ -411,22 +783,28 @@ class QuadHoverEnv:
 
         assert self._drone is not None
         sim_time_s = self._step_count * DT
-        wind = self._wind_velocity_world(sim_time_s)
+        self._update_wind_turbulence()
+        mean_wind = self._mean_wind_velocity(sim_time_s)
+        wind = self._effective_wind_velocity(sim_time_s)
         rel = (wind[0] - lin_vel[0], wind[1] - lin_vel[1], wind[2] - lin_vel[2])
         k_lin, k_quad = wcfg.drag_coeff, wcfg.quad_drag_coeff
         force = tuple(self._drag_force_axis(rel[i], k_lin, k_quad) for i in range(3))
         fn = wcfg.force_noise_std
-        force = tuple(
-            force[i] + self._wind_rng.gauss(0.0, fn) for i in range(3)
+        fn_z = fn * wcfg.force_noise_z_scale
+        force = (
+            force[0] + self._wind_rng.gauss(0.0, fn),
+            force[1] + self._wind_rng.gauss(0.0, fn),
+            force[2] + self._wind_rng.gauss(0.0, fn_z),
         )
         cfn = wcfg.corner_force_noise_std
+        cfn_z = cfn * wcfg.corner_force_noise_z_scale
         corner_forces: list[tuple[float, float, float]] = []
         for _ in self._corners_body:
             corner_forces.append(
                 (
                     force[0] / 4.0 + self._wind_rng.gauss(0.0, cfn),
                     force[1] / 4.0 + self._wind_rng.gauss(0.0, cfn),
-                    force[2] / 4.0 + self._wind_rng.gauss(0.0, cfn),
+                    force[2] / 4.0 + self._wind_rng.gauss(0.0, cfn_z),
                 )
             )
         for corner_body, cf in zip(self._corners_body, corner_forces):
@@ -446,19 +824,28 @@ class QuadHoverEnv:
 
         self._last_wind_info = {
             "velocity": wind,
+            "mean_velocity": mean_wind,
             "turbulence": self._wind_turbulence,
             "relative_air_velocity": rel,
             "force": force,
             "torque": torque,
         }
 
-    def _apply_forces(self, action: list[float] | tuple[float, ...] | None) -> None:
+    def _apply_forces(
+        self,
+        action: list[float] | tuple[float, ...] | None,
+        *,
+        update_viz: bool = True,
+    ) -> None:
         assert self._drone is not None
         pos, orn = p.getBasePositionAndOrientation(self._drone)
         lin_vel, ang_vel = p.getBaseVelocity(self._drone)
         roll, pitch, _ = p.getEulerFromQuaternion(orn)
 
-        if action is None:
+        if self.cfg.hover_balance_thrust:
+            mg4 = MASS * 9.81 / 4.0
+            thrusts = [mg4, mg4, mg4, mg4]
+        elif action is None:
             z_e = self.cfg.target_z - pos[2]
             thrust_sum = MASS * 9.81 + self.cfg.kp_z * z_e - self.cfg.kd_z * lin_vel[2]
             thrust_sum = max(0.0, thrust_sum)
@@ -472,13 +859,11 @@ class QuadHoverEnv:
             if len(thrusts) < 4:
                 thrusts.extend([0.0] * (4 - len(thrusts)))
 
-        thrust_dir = body_z_in_world(orn)
-        for corner_body, thrust in zip(self._corners_body, thrusts):
-            world_point = world_from_body(pos, orn, corner_body)
-            force = scale_vec(thrust_dir, thrust)
-            p.applyExternalForce(self._drone, -1, force, world_point, p.WORLD_FRAME)
+        self._apply_motor_thrusts(pos, orn, thrusts)
 
         self._apply_wind(pos, orn, lin_vel)
+        if update_viz:
+            self._update_force_visualization(pos, pos, orn, lin_vel)
 
     def _check_termination(self, state: DroneState) -> tuple[bool, str | None]:
         if abs(state.roll) >= self.cfg.flip_angle_rad or abs(state.pitch) >= self.cfg.flip_angle_rad:

@@ -15,7 +15,8 @@ from pathlib import Path
 
 import numpy as np
 
-from quad_nav_env import NavEnvConfig, NavWindRandomizationConfig, QuadNavEnv, QuadNavGymEnv, make_nav_env
+from env_config import build_nav_env_config, load_motor_thrust_settings
+from quad_nav_env import QuadNavEnv, QuadNavGymEnv, make_nav_env
 
 
 def _require_gym():
@@ -25,19 +26,28 @@ def _require_gym():
         )
 
 
-def build_vec_env(n_envs: int, seed: int, *, no_wind: bool, action_mode: str):
+def build_vec_env(
+    n_envs: int,
+    seed: int,
+    *,
+    no_wind: bool,
+    action_mode: str,
+    motor_thrust_min: float | None = None,
+    motor_thrust_max: float | None = None,
+):
     _require_gym()
     from stable_baselines3.common.env_util import make_vec_env
     from stable_baselines3.common.monitor import Monitor
     from stable_baselines3.common.vec_env import DummyVecEnv
 
     def _factory():
-        wr = NavWindRandomizationConfig(enabled=not no_wind)
-        cfg = NavEnvConfig(
+        cfg = build_nav_env_config(
             gui=False,
             step_sleep_s=0.0,
-            wind_randomization=wr,
+            no_wind=no_wind,
             action_mode=action_mode,  # type: ignore[arg-type]
+            motor_thrust_min=motor_thrust_min,
+            motor_thrust_max=motor_thrust_max,
         )
         return Monitor(QuadNavGymEnv(cfg))
 
@@ -53,8 +63,31 @@ def train(args: argparse.Namespace) -> Path:
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    vec_env = build_vec_env(args.n_envs, args.seed, no_wind=args.no_wind, action_mode=args.action_mode)
-    eval_env = build_vec_env(1, args.seed + 1, no_wind=args.no_wind, action_mode=args.action_mode)
+    thrust = load_motor_thrust_settings(
+        min_n=args.motor_thrust_min,
+        max_n=args.motor_thrust_max,
+    )
+    print(
+        f"Motor thrust map: action [-1,1] -> [{thrust.min_n}, {thrust.max_n}] N per rotor "
+        f"(linear: thrust = {thrust.min_n} + ({thrust.max_n}-{thrust.min_n})*(action+1)/2)"
+    )
+
+    vec_env = build_vec_env(
+        args.n_envs,
+        args.seed,
+        no_wind=args.no_wind,
+        action_mode=args.action_mode,
+        motor_thrust_min=args.motor_thrust_min,
+        motor_thrust_max=args.motor_thrust_max,
+    )
+    eval_env = build_vec_env(
+        1,
+        args.seed + 1,
+        no_wind=args.no_wind,
+        action_mode=args.action_mode,
+        motor_thrust_min=args.motor_thrust_min,
+        motor_thrust_max=args.motor_thrust_max,
+    )
 
     model = PPO(
         "MlpPolicy",
@@ -102,9 +135,29 @@ def evaluate(args: argparse.Namespace) -> None:
     if not os.path.isfile(model_path):
         raise FileNotFoundError(model_path)
 
-    cfg = NavEnvConfig(gui=args.gui, step_sleep_s=0.01 if args.gui else 0.0)
+    cfg = build_nav_env_config(
+        gui=args.gui,
+        step_sleep_s=args.sleep,
+        motor_thrust_min=args.motor_thrust_min,
+        motor_thrust_max=args.motor_thrust_max,
+        gui_realtime=args.realtime,
+        gui_fast=args.fast,
+    )
+    if args.no_viz:
+        cfg.show_wind_visualization = False
+        cfg.show_thrust_visualization = False
     env = QuadNavEnv(cfg)
     model = PPO.load(model_path)
+
+    if args.gui:
+        step_sleep_s = cfg.step_sleep_s
+        if step_sleep_s > 0.0:
+            print(
+                f"Playback: {step_sleep_s * 1000:.1f} ms per RL step "
+                f"(~{1.0 / step_sleep_s:.0f} agent steps/s view)"
+            )
+        else:
+            print("Playback: max speed (use --sleep 0.01 or --realtime to slow down)")
 
     successes = 0
     crashes = 0
@@ -171,6 +224,40 @@ def main() -> None:
         choices=("motors", "mixer"),
         default="motors",
         help="motors = 4 thrusts; mixer = thrust+attitude mix (easier)",
+    )
+    parser.add_argument(
+        "--motor-thrust-min",
+        type=float,
+        default=None,
+        help="Per-motor thrust at action -1 (N); overrides MOTOR_THRUST_MIN_N in .env",
+    )
+    parser.add_argument(
+        "--motor-thrust-max",
+        type=float,
+        default=None,
+        help="Per-motor thrust at action +1 (N); overrides MOTOR_THRUST_MAX_N in .env",
+    )
+    parser.add_argument(
+        "--sleep",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="GUI eval: pause once per RL step (default 0.01 s when --gui)",
+    )
+    parser.add_argument(
+        "--realtime",
+        action="store_true",
+        help="GUI eval: match sim time (~60 agent steps/s with frame_skip=4)",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="GUI eval: no frame sleep (max speed)",
+    )
+    parser.add_argument(
+        "--no-viz",
+        action="store_true",
+        help="GUI eval: disable force/wind debug arrows (smoother FPS)",
     )
     args = parser.parse_args()
 
