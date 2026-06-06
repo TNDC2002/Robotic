@@ -39,48 +39,53 @@ Example: `MIN=0`, `MAX=4` → `-1→0 N`, `-0.5→1 N`, `0→2 N`, `0.5→3 N`, 
 | `GUI_REALTIME` | `0` | `1` = match sim clock |
 | `GUI_FAST` | `0` | `1` = no sleep (max speed) |
 
-### Fixed wind (demo / `--no-wind` training)
+### Wind (nav train/eval + hover demo)
 
-Used by `rl_interact_demo.py` and when `WIND_RANDOMIZATION=0`.
+Each episode draws wind uniformly from `*_MIN` / `*_MAX` ranges in `.env` (horizontal speed + random direction). Same sampling for **training**, **`train_nav_rl.py --eval`**, and **`rl_interact_demo.py`** (QuadNavEnv).
 
 | Variable | Meaning |
 |----------|---------|
-| `WIND_ENABLED` | `1` = wind on |
-| `WIND_VX`, `WIND_VY`, `WIND_VZ` | Mean wind velocity (m/s) |
-| `WIND_DRAG`, `WIND_QUAD_DRAG` | Drag coefficients |
-| `WIND_GUST` | Sinusoidal gust amplitude (m/s) |
-| `WIND_TURBULENCE_SCALE` | Multiplier on base turbulence |
-| `WIND_TURBULENCE_BASE_X/Y/Z` | OU turbulence std (m/s) |
-| `WIND_FORCE_NOISE`, `WIND_CORNER_NOISE`, `WIND_TORQUE_NOISE` | Extra noise (N or N·m) |
-| `WIND_FORCE_NOISE_Z_SCALE`, `WIND_CORNER_NOISE_Z_SCALE` | Softer vertical noise |
-| `WIND_VERTICAL_GUST_COUPLING` | Vertical fraction of gust |
-
-See `.env.example` for the full list.
-
-### Random wind (navigation training)
-
-When `WIND_RANDOMIZATION=1` (default for training), each episode samples wind from `*_MIN` / `*_MAX` ranges (`WIND_SPEED_MIN`, `WIND_DRAG_MIN`, etc.).
-
-Training with fixed wind instead:
+| `WIND_ENABLED` | `0` = no wind (or use `--no-wind`) |
+| `WIND_INCLUDE_IN_OBS` | Append effective wind to RL observations |
+| `WIND_SEED` | Optional; reproducible episode sampling |
+| `WIND_SPEED_MIN/MAX` | Horizontal wind speed (m/s) |
+| `WIND_DRAG_MIN/MAX` | Linear drag coefficient |
+| `WIND_QUAD_DRAG_MIN/MAX` | Quadratic drag |
+| `WIND_TURBULENCE_SCALE_MIN/MAX` | Turbulence multiplier |
+| `WIND_FORCE_NOISE_MIN/MAX` | Extra drag force noise (N) |
+| `WIND_CORNER_NOISE_MIN/MAX` | Per-motor corner noise (N) |
+| `WIND_TORQUE_NOISE_MIN/MAX` | Torque noise (N·m) |
+| `WIND_GUST_MIN/MAX` | Sinusoidal gust amplitude (m/s) |
 
 ```bash
-# .env: WIND_RANDOMIZATION=0 and set WIND_VX, WIND_VY, ...
-python train_nav_rl.py --no-wind   # or configure fixed WIND_* in .env
+python train_nav_rl.py --no-wind          # disable for one run
+python rl_interact_demo.py --gui --no-wind
 ```
 
-## Wind-tunnel / hover-balance mode
+See `.env.example` for defaults.
 
-Hold thrust fixed at **m·g / 4 per motor** (total = weight) so the drone floats while wind pushes it — useful to inspect force arrows and wind settings without a trained policy.
+### Navigation reward weights
+
+Tune PPO shaping via `REWARD_*` in `.env` (see [REWARD.md](REWARD.md) for formulas):
+
+```env
+REWARD_W_PROGRESS=8.0
+REWARD_SUCCESS_BONUS=120.0
+REWARD_CRASH_PENALTY=80.0
+```
+
+## Wind-tunnel / hover-balance preview
+
+Uses **`QuadNavEnv`** — the same environment and per-episode wind sampling as PPO **train** and **`--eval`**. Each reset draws wind from `WIND_*_MIN/MAX` in `.env`.
 
 ```bash
-# CLI
 python rl_interact_demo.py --gui --hover-balance --seconds 60
-
-# Or .env: HOVER_BALANCE_MODE=1
-python rl_interact_demo.py --gui --seconds 60
+python rl_interact_demo.py --gui --no-wind   # disable wind
 ```
 
-Tune wind in `.env` (`WIND_VX`, `WIND_DRAG`, turbulence, noise) and re-run. Debug arrows show drag vs thrust vs weight in **Newtons** (same scale).
+Fixed **m·g/4** per motor (`--hover-balance`, default on in this script) so you can watch force arrows without a trained policy. The printed **sampled episode wind** line matches what navigation training sees at reset.
+
+Tune ranges in `.env` (`WIND_SPEED_MIN/MAX`, drag, turbulence, noise).
 
 ## Training
 
@@ -88,7 +93,26 @@ Tune wind in `.env` (`WIND_VX`, `WIND_DRAG`, turbulence, noise) and re-run. Debu
 python train_nav_rl.py --timesteps 400000 --n-envs 8 --n-steps 1024 --batch-size 512
 ```
 
-Disable random wind:
+Learning rate schedule (`.env` or CLI `--lr`, `--lr-schedule`, `--lr-final`):
+
+```env
+PPO_LEARNING_RATE=0.0003
+PPO_LR_FINAL=0.00001
+PPO_LR_SCHEDULE=linear   # constant | linear | cosine
+```
+
+Disable decay: `PPO_LR_SCHEDULE=constant`, or set `PPO_LR_FINAL` equal to `PPO_LEARNING_RATE`.
+
+Model saves (`.env` or CLI `--save-ckpt`, `--no-save-ckpt`, `--save-freq`, etc.):
+
+```env
+PPO_SAVE_CKPT=1          # periodic ckpt/ (0 = best + final only)
+PPO_CKPT_FREQ=50000      # timesteps between ckpt saves
+PPO_SAVE_BEST=1          # best/ from eval callback
+PPO_SAVE_FINAL=1         # final_model.zip at end
+```
+
+Disable wind for one run:
 
 ```bash
 python train_nav_rl.py --no-wind
@@ -96,9 +120,9 @@ python train_nav_rl.py --no-wind
 
 ### Outputs
 
-- `runs/nav_ppo/ckpt/` — periodic checkpoints
-- `runs/nav_ppo/best/best_model.zip` — best eval model
-- `runs/nav_ppo/final_model.zip` — model at end of training
+- `runs/nav_ppo/ckpt/` — periodic checkpoints (when `PPO_SAVE_CKPT=1`)
+- `runs/nav_ppo/best/best_model.zip` — best eval model (when `PPO_SAVE_BEST=1`)
+- `runs/nav_ppo/final_model.zip` — model at end of training (when `PPO_SAVE_FINAL=1`)
 
 ### Resume training
 
@@ -111,14 +135,16 @@ python train_nav_rl.py --eval --gui --model runs/nav_ppo/best/best_model.zip
 python train_nav_rl.py --eval --gui --sleep 0.02 --no-viz --model runs/nav_ppo/best/best_model.zip
 ```
 
-Uses `.env` for thrust range, wind randomization, and `GUI_STEP_SLEEP_S`.
+Uses `.env` for thrust range, wind ranges, and `GUI_STEP_SLEEP_S`.
+
+Unlimited GUI episodes (no ~60 s timeout): set `GUI_UNLIMITED_EPISODE=1` — episode ends only on **success** or **crash**.
 
 ## Hover demo (no RL)
 
 ```bash
 python rl_interact_demo.py --gui
 python rl_interact_demo.py --gui --hover-balance --seconds 120
-python rl_interact_demo.py --gui --wind 1.5 0 0    # CLI overrides WIND_VX/Y/Z
+python rl_interact_demo.py --gui --no-wind
 ```
 
 ## SLURM
@@ -138,4 +164,5 @@ Logs: `logs/slurm-<jobid>.out`, `logs/job_<jobid>.log`.
 | `train_nav_rl.py` | PPO training / eval |
 | `rl_interact_demo.py` | Readable hover / wind-tunnel demo |
 | `env_config.py` | `.env` loader |
+| `REWARD.md` | Reward function reference (navigation + hover) |
 | `.env` | Local config (gitignored) |

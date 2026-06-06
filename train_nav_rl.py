@@ -15,7 +15,16 @@ from pathlib import Path
 
 import numpy as np
 
-from env_config import build_nav_env_config, load_motor_thrust_settings
+from env_config import (
+    build_nav_env_config,
+    build_ppo_learning_rate,
+    describe_nav_wind_settings,
+    describe_ppo_checkpoint_settings,
+    describe_ppo_learning_rate,
+    load_motor_thrust_settings,
+    load_ppo_checkpoint_settings,
+    load_ppo_lr_settings,
+)
 from quad_nav_env import QuadNavEnv, QuadNavGymEnv, make_nav_env
 
 
@@ -71,6 +80,13 @@ def train(args: argparse.Namespace) -> Path:
         f"Motor thrust map: action [-1,1] -> [{thrust.min_n}, {thrust.max_n}] N per rotor "
         f"(linear: thrust = {thrust.min_n} + ({thrust.max_n}-{thrust.min_n})*(action+1)/2)"
     )
+    nav_cfg = build_nav_env_config(
+        no_wind=args.no_wind,
+        action_mode=args.action_mode,
+        motor_thrust_min=args.motor_thrust_min,
+        motor_thrust_max=args.motor_thrust_max,
+    )
+    print(f"Wind: {describe_nav_wind_settings(nav_cfg, cli_no_wind=args.no_wind)}")
 
     vec_env = build_vec_env(
         args.n_envs,
@@ -89,12 +105,28 @@ def train(args: argparse.Namespace) -> Path:
         motor_thrust_max=args.motor_thrust_max,
     )
 
+    lr_settings = load_ppo_lr_settings(
+        lr=args.lr,
+        lr_final=args.lr_final,
+        schedule=args.lr_schedule,
+    )
+    learning_rate = build_ppo_learning_rate(lr_settings)
+    print(f"Learning rate schedule: {describe_ppo_learning_rate(lr_settings)}")
+
+    ckpt_settings = load_ppo_checkpoint_settings(
+        save_ckpt=args.save_ckpt,
+        ckpt_freq=args.save_freq,
+        save_best=args.save_best,
+        save_final=args.save_final,
+    )
+    print(f"Model saves: {describe_ppo_checkpoint_settings(ckpt_settings)}")
+
     model = PPO(
         "MlpPolicy",
         vec_env,
         verbose=1,
         seed=args.seed,
-        learning_rate=args.lr,
+        learning_rate=learning_rate,
         n_steps=args.n_steps,
         batch_size=args.batch_size,
         gamma=args.gamma,
@@ -103,13 +135,18 @@ def train(args: argparse.Namespace) -> Path:
         tensorboard_log=str(out_dir / "tb") if args.tensorboard else None,
     )
 
-    callbacks = [
-        CheckpointCallback(save_freq=max(args.save_freq // args.n_envs, 1), save_path=str(out_dir / "ckpt")),
-    ]
+    callbacks = []
+    if ckpt_settings.save_ckpt:
+        callbacks.append(
+            CheckpointCallback(
+                save_freq=max(ckpt_settings.ckpt_freq // args.n_envs, 1),
+                save_path=str(out_dir / "ckpt"),
+            )
+        )
     callbacks.append(
         EvalCallback(
             eval_env,
-            best_model_save_path=str(out_dir / "best"),
+            best_model_save_path=str(out_dir / "best") if ckpt_settings.save_best else None,
             log_path=str(out_dir / "eval"),
             eval_freq=max(args.eval_freq // args.n_envs, 1),
             n_eval_episodes=args.eval_episodes,
@@ -118,9 +155,12 @@ def train(args: argparse.Namespace) -> Path:
     )
 
     model.learn(total_timesteps=args.timesteps, callback=callbacks, progress_bar=args.progress_bar)
-    final_path = out_dir / "final_model"
-    model.save(final_path)
-    print(f"Saved final model to {final_path}.zip")
+    if ckpt_settings.save_final:
+        final_path = out_dir / "final_model"
+        model.save(final_path)
+        print(f"Saved final model to {final_path}.zip")
+    else:
+        print("Skipping final model save (PPO_SAVE_FINAL=0)")
     vec_env.close()
     eval_env.close()
     return out_dir
@@ -138,16 +178,21 @@ def evaluate(args: argparse.Namespace) -> None:
     cfg = build_nav_env_config(
         gui=args.gui,
         step_sleep_s=args.sleep,
+        no_wind=args.no_wind,
         motor_thrust_min=args.motor_thrust_min,
         motor_thrust_max=args.motor_thrust_max,
         gui_realtime=args.realtime,
         gui_fast=args.fast,
     )
+    print(f"Wind: {describe_nav_wind_settings(cfg, cli_no_wind=args.no_wind)}")
     if args.no_viz:
         cfg.show_wind_visualization = False
         cfg.show_thrust_visualization = False
     env = QuadNavEnv(cfg)
     model = PPO.load(model_path)
+
+    if cfg.unlimited_episode:
+        print("Episode horizon: unlimited (GUI_UNLIMITED_EPISODE — until success or crash)")
 
     if args.gui:
         step_sleep_s = cfg.step_sleep_s
@@ -207,18 +252,62 @@ def main() -> None:
     parser.add_argument("--timesteps", type=int, default=400_000)
     parser.add_argument("--n-envs", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Initial PPO learning rate; default from PPO_LEARNING_RATE in .env (3e-4)",
+    )
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("constant", "linear", "cosine"),
+        default=None,
+        help="LR schedule; default from PPO_LR_SCHEDULE in .env (linear)",
+    )
+    parser.add_argument(
+        "--lr-final",
+        type=float,
+        default=None,
+        help="Final LR when schedule is linear/cosine; default PPO_LR_FINAL in .env (1e-5)",
+    )
     parser.add_argument("--n-steps", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--ent-coef", type=float, default=0.01)
-    parser.add_argument("--save-freq", type=int, default=50_000)
+    parser.add_argument(
+        "--save-freq",
+        type=int,
+        default=None,
+        help="Periodic ckpt interval in timesteps; default PPO_CKPT_FREQ in .env (50000)",
+    )
+    parser.add_argument(
+        "--save-ckpt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Write runs/.../ckpt/ during training; default PPO_SAVE_CKPT in .env",
+    )
+    parser.add_argument(
+        "--save-best",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Save best eval model to runs/.../best/; default PPO_SAVE_BEST in .env",
+    )
+    parser.add_argument(
+        "--save-final",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Save final_model.zip at end; default PPO_SAVE_FINAL in .env",
+    )
     parser.add_argument("--eval-freq", type=int, default=20_000)
     parser.add_argument("--eval-episodes", type=int, default=5)
     parser.add_argument("--episodes", type=int, default=5, help="Eval episode count")
     parser.add_argument("--tensorboard", action="store_true")
     parser.add_argument("--progress-bar", action="store_true", help="Requires tqdm and rich")
-    parser.add_argument("--no-wind", action="store_true", help="Disable per-episode random wind")
+    parser.add_argument(
+        "--no-wind",
+        action="store_true",
+        help="Disable wind for this run (overrides WIND_ENABLED in .env)",
+    )
     parser.add_argument(
         "--action-mode",
         choices=("motors", "mixer"),

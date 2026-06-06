@@ -1,8 +1,8 @@
 """
 Navigate a quadrotor from a fixed spawn to a random goal on a bounded map.
 
-Episode ends on crash (low altitude or flip) or reaching the goal. Reward encourages
-progress toward the goal while staying level and smooth.
+Episode ends on floor crash (low altitude), reaching the goal, or time limit.
+Exceeding the safe tilt angle (``SAFE_ATTITUDE_DEG`` in ``.env``, default 70°) adds a per-step penalty but does not end the episode.
 
 **Actions** (``action_mode``):
 
@@ -25,6 +25,7 @@ import pybullet as p
 
 from quad_drone_sim import HOVER_Z, MASS, allocate_motor_thrusts
 from quad_hover_env import DT, EnvConfig, QuadHoverEnv, WindConfig
+from wind_settings import load_wind_settings, sample_episode_wind
 
 
 def action_to_motor_thrust_n(
@@ -63,26 +64,6 @@ class NavMapConfig:
 
 
 @dataclass
-class NavWindRandomizationConfig:
-    """Per-episode random wind (enabled by default for navigation training)."""
-
-    enabled: bool = True
-    speed_range: tuple[float, float] = (0.5, 2.5)  # m/s, random horizontal direction
-    drag_range: tuple[float, float] = (0.35, 0.75)
-    quad_drag_range: tuple[float, float] = (0.03, 0.08)
-    # Multiplier on base turbulence; keep Z base low in base_turbulence_std.
-    turbulence_scale_range: tuple[float, float] = (2.0, 10.0)
-    force_noise_range: tuple[float, float] = (0.08, 0.5)
-    corner_noise_range: tuple[float, float] = (0.04, 0.15)
-    torque_noise_range: tuple[float, float] = (0.03, 0.12)
-    gust_amplitude_range: tuple[float, float] = (0.0, 0.5)
-    base_turbulence_std: tuple[float, float, float] = (0.4, 0.4, 0.06)
-    vertical_gust_coupling: float = 0.10
-    force_noise_z_scale: float = 0.20
-    corner_force_noise_z_scale: float = 0.20
-
-
-@dataclass
 class NavEnvConfig(EnvConfig):
     """Navigation task settings (extends hover physics config)."""
 
@@ -95,7 +76,6 @@ class NavEnvConfig(EnvConfig):
     frame_skip: int = 4  # physics substeps per agent step
     max_episode_steps: int = 14_400  # physics steps ≈ 60 s at 240 Hz
     action_mode: Literal["motors", "mixer"] = "motors"
-    wind_randomization: NavWindRandomizationConfig = field(default_factory=NavWindRandomizationConfig)
     # Allow high authority under chaotic wind while still requiring control.
     # Per-motor thrust is clipped to MASS * g * max_motor_scale (Newtons).
     max_motor_scale: float = 2.0
@@ -109,12 +89,15 @@ class NavEnvConfig(EnvConfig):
     # Rewards
     w_progress: float = 8.0
     w_goal_dist: float = 0.4
+    w_goal_alt: float = 1.0
+    w_goal_alt_progress: float = 4.0
     w_alive: float = 0.02
     w_attitude: float = 1.2
     w_ang_vel: float = 0.06
     w_lin_vel: float = 0.04
     w_upright: float = 0.15
     w_action_rate: float = 0.02
+    w_unsafe_attitude: float = 5.0  # per substep when |roll| or |pitch| >= flip_angle_rad
     success_bonus: float = 120.0
     crash_penalty: float = 80.0
     time_limit_penalty: float = 15.0
@@ -131,60 +114,37 @@ class QuadNavEnv(QuadHoverEnv):
         self._spawn_pos = (self.nav.spawn_xy[0], self.nav.spawn_xy[1], self.nav.spawn_z)
         self._start_goal_dist = 1.0
         self._prev_goal_dist = 1.0
+        self._prev_goal_alt_err = 0.0
         self._prev_action = np.zeros(4, dtype=np.float64)
         self._goal_marker: int | None = None
         self._episode_rng = np.random.default_rng()
+        self._fixed_wind: WindConfig | None = None
 
     def connect(self) -> None:
         sync_max_motor_scale(self.nav)
         super().connect()
 
     def _wind_in_observation(self) -> bool:
-        if self.nav.wind_randomization.enabled:
-            return True
-        return bool(self.cfg.wind.enabled and self.cfg.wind.include_in_obs)
+        settings = self.nav.wind_settings
+        if settings is None or not settings.enabled:
+            return False
+        return bool(settings.include_in_obs)
 
     @property
     def observation_size(self) -> int:
         return 18 + (3 if self._wind_in_observation() else 0)
 
     def _sample_episode_wind(self) -> WindConfig:
-        """Random wind each episode (strength similar to aggressive demo CLI)."""
-        wr = self.nav.wind_randomization
-        if not wr.enabled:
-            return WindConfig(
-                enabled=self.nav.wind.enabled,
-                velocity=self.nav.wind.velocity,
-                drag_coeff=self.nav.wind.drag_coeff,
-                quad_drag_coeff=self.nav.wind.quad_drag_coeff,
-                turbulence_std=self.nav.wind.turbulence_std,
-                force_noise_std=self.nav.wind.force_noise_std,
-                corner_force_noise_std=self.nav.wind.corner_force_noise_std,
-                torque_noise_std=self.nav.wind.torque_noise_std,
-                gust_amplitude=self.nav.wind.gust_amplitude,
-                include_in_obs=self.nav.wind.include_in_obs,
-            )
+        if self._fixed_wind is not None:
+            return self._fixed_wind
+        settings = self.nav.wind_settings or load_wind_settings()
+        return sample_episode_wind(self._episode_rng, settings)
 
-        speed = float(self._episode_rng.uniform(*wr.speed_range))
-        angle = float(self._episode_rng.uniform(0.0, 2.0 * math.pi))
-        turb_scale = float(self._episode_rng.uniform(*wr.turbulence_scale_range))
-        turb = tuple(turb_scale * t for t in wr.base_turbulence_std)
-        return WindConfig(
-            enabled=True,
-            velocity=(speed * math.cos(angle), speed * math.sin(angle), 0.0),
-            drag_coeff=float(self._episode_rng.uniform(*wr.drag_range)),
-            quad_drag_coeff=float(self._episode_rng.uniform(*wr.quad_drag_range)),
-            turbulence_std=turb,
-            force_noise_std=float(self._episode_rng.uniform(*wr.force_noise_range)),
-            corner_force_noise_std=float(self._episode_rng.uniform(*wr.corner_noise_range)),
-            torque_noise_std=float(self._episode_rng.uniform(*wr.torque_noise_range)),
-            gust_amplitude=float(self._episode_rng.uniform(*wr.gust_amplitude_range)),
-            vertical_gust_coupling=wr.vertical_gust_coupling,
-            force_noise_z_scale=wr.force_noise_z_scale,
-            corner_force_noise_z_scale=wr.corner_force_noise_z_scale,
-            include_in_obs=True,
-            seed=int(self._episode_rng.integers(0, 2**31 - 1)),
-        )
+    def _resample_episode_wind(self) -> None:
+        self.cfg.wind = self._sample_episode_wind()
+        self._wind_turbulence = (0.0, 0.0, 0.0)
+        self._wind_rng = random.Random(self.cfg.wind.seed)
+        self._sync_wind_visualize_flag()
 
     def _sample_goal(self) -> tuple[float, float, float]:
         m = self.nav.map
@@ -207,6 +167,9 @@ class QuadNavEnv(QuadHoverEnv):
             + (pos[1] - self._goal_pos[1]) ** 2
             + (pos[2] - self._goal_pos[2]) ** 2
         )
+
+    def _goal_alt_error(self, pos: tuple[float, float, float]) -> float:
+        return abs(pos[2] - self._goal_pos[2])
 
     def _update_goal_marker(self) -> None:
         if not self.nav.show_goal_marker or self._drone is None:
@@ -235,21 +198,21 @@ class QuadNavEnv(QuadHoverEnv):
     ) -> np.ndarray:
         if seed is not None:
             self._episode_rng = np.random.default_rng(seed)
+        elif self.nav.wind_settings is not None and self.nav.wind_settings.seed is not None:
+            self._episode_rng = np.random.default_rng(self.nav.wind_settings.seed)
         self._goal_pos = self._sample_goal()
         self._spawn_pos = (
             self.nav.spawn_xy[0],
             self.nav.spawn_xy[1],
             self.nav.spawn_z,
         )
-        self.cfg.wind = self._sample_episode_wind()
-        self._wind_turbulence = (0.0, 0.0, 0.0)
-        self._wind_rng = random.Random(self.cfg.wind.seed)
         spawn = pos if pos is not None else self._spawn_pos
         state = super().reset(pos=spawn, orn=orn)
         self._clear_force_visualization()
         self._update_goal_marker()
         self._start_goal_dist = self._goal_distance(state.pos)
         self._prev_goal_dist = self._start_goal_dist
+        self._prev_goal_alt_err = self._goal_alt_error(state.pos)
         self._prev_action = np.zeros(4, dtype=np.float64)
         return self.observation_vector_from_physics()
 
@@ -346,11 +309,21 @@ class QuadNavEnv(QuadHoverEnv):
         update_viz: bool = True,
     ) -> None:
         assert self._drone is not None
+        pos, orn = p.getBasePositionAndOrientation(self._drone)
+        lin_vel, _ = p.getBaseVelocity(self._drone)
+
+        if self.cfg.hover_balance_thrust:
+            mg4 = MASS * 9.81 / 4.0
+            thrusts = [mg4, mg4, mg4, mg4]
+            self._apply_motor_thrusts(pos, orn, thrusts)
+            self._apply_wind(pos, orn, lin_vel)
+            if update_viz:
+                self._update_force_visualization(pos, pos, orn, lin_vel)
+            return
+
         if action is None:
             raise ValueError("QuadNavEnv requires an RL action each step")
         thrusts = self._decode_action(action)  # type: ignore[arg-type]
-        pos, orn = p.getBasePositionAndOrientation(self._drone)
-        lin_vel, _ = p.getBaseVelocity(self._drone)
         self._apply_motor_thrusts(pos, orn, thrusts)
         self._apply_wind(pos, orn, lin_vel)
         if update_viz:
@@ -373,9 +346,15 @@ class QuadNavEnv(QuadHoverEnv):
         progress = self._prev_goal_dist - dist
         self._prev_goal_dist = dist
 
+        alt_err = self._goal_alt_error(pos)
+        alt_progress = self._prev_goal_alt_err - alt_err
+        self._prev_goal_alt_err = alt_err
+
         parts = {
             "progress": self.nav.w_progress * progress,
             "goal_dist": -self.nav.w_goal_dist * dist,
+            "goal_alt": -self.nav.w_goal_alt * alt_err,
+            "goal_alt_progress": self.nav.w_goal_alt_progress * alt_progress,
             "alive": self.nav.w_alive,
             "attitude": -self.nav.w_attitude * (abs(roll) + abs(pitch)),
             "ang_vel": -self.nav.w_ang_vel * math.sqrt(sum(w * w for w in ang_vel)),
@@ -383,6 +362,8 @@ class QuadNavEnv(QuadHoverEnv):
             "upright": self.nav.w_upright * max(0.0, uprightness),
             "action_rate": -self.nav.w_action_rate * float(np.sum((action - self._prev_action) ** 2)),
         }
+        if self._attitude_unsafe(roll, pitch):
+            parts["unsafe_attitude"] = -self.nav.w_unsafe_attitude
         terminal = 0.0
         if done:
             if terminal_reason == "success":
@@ -415,7 +396,7 @@ class QuadNavEnv(QuadHoverEnv):
             lin_vel, ang_vel = p.getBaseVelocity(self._drone)
             roll, pitch, yaw = p.getEulerFromQuaternion(orn)
             uprightness = self._uprightness_from_orn(orn)
-            done, terminal_reason = self._check_termination_simple(pos, roll, pitch)
+            done, terminal_reason = self._check_termination_simple(pos)
             step_reward, last_parts = self._compute_nav_reward(
                 pos=pos,
                 roll=roll,
@@ -446,9 +427,16 @@ class QuadNavEnv(QuadHoverEnv):
             "reward_parts": last_parts,
             "step": self._step_count,
             "action_mode": self.nav.action_mode,
-            "motor_thrusts": self._decode_action(action_arr),
+            "motor_thrusts": (
+                [MASS * 9.81 / 4.0] * 4
+                if self.cfg.hover_balance_thrust
+                else self._decode_action(action_arr)
+            ),
+            "unsafe_attitude": self._attitude_unsafe(roll, pitch),
         }
-        if self.cfg.wind.enabled:
+        if self._last_wind_info is not None:
+            info["wind"] = self._last_wind_info
+        elif self.cfg.wind.enabled:
             info["wind"] = {
                 "velocity": self.cfg.wind.velocity,
                 "drag_coeff": self.cfg.wind.drag_coeff,
@@ -457,21 +445,21 @@ class QuadNavEnv(QuadHoverEnv):
             }
         return obs, total_reward, done, info
 
+    def _attitude_unsafe(self, roll: float, pitch: float) -> bool:
+        limit = self.cfg.flip_angle_rad
+        return abs(roll) >= limit or abs(pitch) >= limit
+
     def _check_termination_simple(
         self,
         pos: tuple[float, float, float],
-        roll: float,
-        pitch: float,
     ) -> tuple[bool, str | None]:
         if pos[2] <= self.cfg.crash_z:
-            return True, "crash"
-        if abs(roll) >= self.cfg.flip_angle_rad or abs(pitch) >= self.cfg.flip_angle_rad:
             return True, "crash"
         dist_xy = math.hypot(pos[0] - self._goal_pos[0], pos[1] - self._goal_pos[1])
         dist_z = abs(pos[2] - self._goal_pos[2])
         if dist_xy <= self.nav.goal_radius and dist_z <= self.nav.goal_z_tolerance:
             return True, "success"
-        if self._step_count >= self.nav.max_episode_steps:
+        if not self.cfg.unlimited_episode and self._step_count >= self.nav.max_episode_steps:
             return True, "time_limit"
         return False, None
 
@@ -502,9 +490,9 @@ def make_nav_env(
         motor_thrust_min=motor_thrust_min,
         motor_thrust_max=motor_thrust_max,
     )
-    if wind is not None:
-        cfg.wind = wind
     env = QuadNavEnv(cfg)
+    if wind is not None:
+        env._fixed_wind = wind
     if seed is not None:
         env._episode_rng = np.random.default_rng(seed)
     return env

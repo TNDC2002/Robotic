@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 import pybullet as p
 
 from quad_drone_sim import (
@@ -92,6 +94,8 @@ class EnvConfig:
     crash_z: float = 0.12
     max_xy: float = 2.5
     gui: bool = False
+    # GUI playback: no max_episode_steps timeout (episode ends on task failure/success only).
+    unlimited_episode: bool = False
     # Wall-clock pause after each stepSimulation (0 = as fast as possible).
     step_sleep_s: float = 0.0
     show_wind_visualization: bool = True  # drag-force arrows in GUI when wind is enabled
@@ -102,6 +106,7 @@ class EnvConfig:
     force_viz_max_length: float = 1.2
     force_viz_update_stride: int = 1
     wind: WindConfig = field(default_factory=WindConfig)
+    wind_settings: "WindSettings | None" = None
     # PD hover controller (used when action is None)
     kp_z: float = 18.0
     kd_z: float = 4.5
@@ -241,6 +246,19 @@ class QuadHoverEnv:
         self._force_viz_text_id: int = -1
         self._last_thrusts: list[float] = [0.0, 0.0, 0.0, 0.0]
         self._last_thrust_dir: tuple[float, float, float] = (0.0, 0.0, 1.0)
+        self._episode_rng = np.random.default_rng()
+
+    def _resample_episode_wind(self) -> None:
+        from wind_settings import load_wind_settings, sample_episode_wind
+
+        settings = self.cfg.wind_settings or load_wind_settings()
+        self.cfg.wind_settings = settings
+        if settings.seed is not None:
+            self._episode_rng = np.random.default_rng(settings.seed)
+        self.cfg.wind = sample_episode_wind(self._episode_rng, settings)
+        self._wind_turbulence = (0.0, 0.0, 0.0)
+        self._wind_rng = random.Random(self.cfg.wind.seed)
+        self._sync_wind_visualize_flag()
 
     def _sync_wind_visualize_flag(self) -> None:
         self.cfg.wind.visualize = bool(
@@ -646,9 +664,13 @@ class QuadHoverEnv:
         *,
         pos: tuple[float, float, float] | None = None,
         orn: tuple[float, float, float, float] | None = None,
+        seed: int | None = None,
     ) -> DroneState:
         self.connect()
         assert self._drone is not None
+
+        if seed is not None:
+            self._episode_rng = np.random.default_rng(seed)
 
         if pos is None:
             pos = (self.cfg.target_xy[0], self.cfg.target_xy[1], self.cfg.target_z)
@@ -660,9 +682,7 @@ class QuadHoverEnv:
         self._step_count = 0
         self._roll_trim = 0.0
         self._pitch_trim = 0.0
-        self._wind_turbulence = (0.0, 0.0, 0.0)
-        self._wind_rng = random.Random(self.cfg.wind.seed)
-        self._sync_wind_visualize_flag()
+        self._resample_episode_wind()
         self._clear_force_visualization()
         return self._read_state()
 
@@ -872,7 +892,7 @@ class QuadHoverEnv:
             return True, "crash"
         if state.err_xy >= self.cfg.max_xy:
             return True, "out_of_bounds"
-        if self._step_count >= self.cfg.max_episode_steps:
+        if not self.cfg.unlimited_episode and self._step_count >= self.cfg.max_episode_steps:
             return True, "time_limit"
         return False, None
 
