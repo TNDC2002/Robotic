@@ -11,8 +11,10 @@ Set ``NAV_END_ON_UNSAFE_ATTITUDE=1`` in ``.env`` to end the episode on excessive
 **Actions** (``action_mode``):
 
 - ``"motors"`` (default): 4 numbers in [-1, 1] → thrust (N) at each of the four
-  rotors (front-left, front-right, back-left, back-right). This matches four engines.
-- ``"mixer"``: 4 numbers → total thrust + roll/pitch/yaw mixing (easier to learn).
+  rotors (front-left, front-right, back-left, back-right). Set via ``NAV_ACTION_MODE=motors``.
+- ``"mixer"``: 4 numbers in [-1, 1] → ``[thrust_delta, roll_mix, pitch_mix, yaw_mix]``
+  (not 2D — same action size, different meaning). ``a0=0`` + zero mix = hover (~m·g total).
+  Set via ``NAV_ACTION_MODE=mixer``.
 
 Gymnasium wrapper: ``QuadNavGymEnv`` for Stable-Baselines3 / similar trainers.
 """
@@ -50,11 +52,11 @@ def action_to_motor_thrust_n(
 
 
 def sync_max_motor_scale(cfg: "NavEnvConfig") -> None:
-    """Ensure per-motor physics cap is at least ``motor_thrust_max``."""
+    """Set physics per-motor cap to ``motor_thrust_max`` (N) for motors and mixer modes."""
     mg = MASS * 9.81
-    required_scale = cfg.motor_thrust_max / mg
-    if cfg.max_motor_scale < required_scale:
-        cfg.max_motor_scale = required_scale
+    if cfg.motor_thrust_max <= 0.0:
+        raise ValueError(f"motor_thrust_max must be > 0, got {cfg.motor_thrust_max}")
+    cfg.max_motor_scale = cfg.motor_thrust_max / mg
 
 
 @dataclass
@@ -85,9 +87,8 @@ class NavEnvConfig(EnvConfig):
     frame_skip: int = 4  # physics substeps per agent step
     max_episode_steps: int = 14_400  # physics steps ≈ 60 s at 240 Hz
     action_mode: Literal["motors", "mixer"] = "motors"
-    # Allow high authority under chaotic wind while still requiring control.
-    # Per-motor thrust is clipped to MASS * g * max_motor_scale (Newtons).
-    max_motor_scale: float = 2.0
+    # Per-motor thrust clip (N): MOTOR_THRUST_MIN_N / MOTOR_THRUST_MAX_N in .env (both action modes).
+    max_motor_scale: float = 2.0  # overwritten by sync_max_motor_scale → motor_thrust_max / (m·g)
     # mixer mode only (action in [-1, 1])
     thrust_delta_scale: float = 0.35
     attitude_mix_scale: float = 0.85
@@ -285,21 +286,27 @@ class QuadNavEnv(QuadHoverEnv):
         tip = body_z_in_world(orn)
         return tip[2]
 
+    def _clamp_motor_thrusts(self, thrusts: list[float]) -> list[float]:
+        lo = self.nav.motor_thrust_min
+        hi = self.nav.motor_thrust_max
+        return [min(hi, max(lo, float(t))) for t in thrusts]
+
     def _decode_action_mixer(self, action: np.ndarray) -> list[float]:
         a = np.clip(action, -1.0, 1.0)
         g = 9.81
+        t_max = self.nav.motor_thrust_max
         thrust_sum = MASS * g * (1.0 + self.nav.thrust_delta_scale * a[0])
-        thrust_sum = max(0.0, min(4.0 * self._max_motor, thrust_sum))
+        thrust_sum = max(0.0, min(4.0 * t_max, thrust_sum))
         mix_r = self.nav.attitude_mix_scale * a[1]
         mix_p = self.nav.attitude_mix_scale * a[2]
-        thrusts = allocate_motor_thrusts(thrust_sum, mix_r, mix_p, self._signs_xy, self._max_motor)
+        thrusts = allocate_motor_thrusts(thrust_sum, mix_r, mix_p, self._signs_xy, t_max)
         if abs(a[3]) > 1e-6:
             yaw_delta = self.nav.yaw_mix_scale * a[3] * (MASS * g * 0.08)
-            thrusts[0] = min(self._max_motor, thrusts[0] + yaw_delta)
-            thrusts[1] = min(self._max_motor, thrusts[1] + yaw_delta)
+            thrusts[0] = min(t_max, thrusts[0] + yaw_delta)
+            thrusts[1] = min(t_max, thrusts[1] + yaw_delta)
             thrusts[2] = max(0.0, thrusts[2] - yaw_delta)
             thrusts[3] = max(0.0, thrusts[3] - yaw_delta)
-        return thrusts
+        return self._clamp_motor_thrusts(thrusts)
 
     def _decode_action_motors(self, action: np.ndarray) -> list[float]:
         """Map 4D policy output to per-rotor thrust (N).
@@ -314,10 +321,10 @@ class QuadNavEnv(QuadHoverEnv):
         a = np.clip(action, -1.0, 1.0)
         t_min = self.nav.motor_thrust_min
         t_max = self.nav.motor_thrust_max
-        return [
-            float(min(self._max_motor, action_to_motor_thrust_n(a[i], t_min, t_max)))
+        return self._clamp_motor_thrusts([
+            float(action_to_motor_thrust_n(a[i], t_min, t_max))
             for i in range(4)
-        ]
+        ])
 
     def _decode_action(self, action: np.ndarray | list[float]) -> list[float]:
         arr = np.clip(np.asarray(action, dtype=np.float64), -1.0, 1.0)

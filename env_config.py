@@ -624,12 +624,24 @@ def build_hover_env_config(
     return cfg
 
 
+NavActionMode = Literal["motors", "mixer"]
+
+
+def load_nav_action_mode(*, action_mode: str | None = None) -> NavActionMode:
+    """Read ``NAV_ACTION_MODE`` from env or CLI (``motors`` | ``mixer``)."""
+    raw = action_mode if action_mode is not None else _env_str("NAV_ACTION_MODE", "motors")
+    mode = raw.strip().lower()
+    if mode not in ("motors", "mixer"):
+        raise ValueError(f"NAV_ACTION_MODE must be motors or mixer, got {raw!r}")
+    return mode  # type: ignore[return-value]
+
+
 def build_nav_env_config(
     *,
     gui: bool = False,
     step_sleep_s: float | None = None,
     no_wind: bool = False,
-    action_mode: Literal["motors", "mixer"] = "motors",
+    action_mode: NavActionMode | None = None,
     motor_thrust_min: float | None = None,
     motor_thrust_max: float | None = None,
     gui_realtime: bool = False,
@@ -659,6 +671,7 @@ def build_nav_env_config(
     )
     rewards = load_nav_reward_settings()
     spawn = load_nav_spawn_settings()
+    resolved_action_mode = load_nav_action_mode(action_mode=action_mode)
     nav_map = NavMapConfig(cruise_z=spawn.spawn_z, z_max=spawn.map_z_max)
     cfg = NavEnvConfig(
         gui=gui,
@@ -667,7 +680,7 @@ def build_nav_env_config(
         unlimited_episode=load_gui_unlimited_episode(gui=gui, cli_flag=gui_unlimited),
         hover_balance_thrust=load_hover_balance_mode(cli_flag=hover_balance),
         wind_settings=wind_settings,
-        action_mode=action_mode,
+        action_mode=resolved_action_mode,
         motor_thrust_min=thrust.min_n,
         motor_thrust_max=thrust.max_n,
         map=nav_map,

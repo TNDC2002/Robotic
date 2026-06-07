@@ -16,20 +16,40 @@ cp .env.example .env        # edit thrust, wind, GUI speed
 
 Settings load from `.env` automatically (`env_config.py`). **CLI flags override `.env`.**
 
-### Motor thrust (navigation RL)
+### Motor thrust (both action modes)
 
-Linear map from policy action `[-1, 1]` to per-motor thrust (N):
+Per-rotor thrust limits (N) from `.env` — used by **`motors`** and **`mixer`**:
 
 ```text
-thrust_N = MIN + (MAX - MIN) * (action + 1) / 2
+thrust_N = MIN + (MAX - MIN) * (action + 1) / 2   # motors mode only (linear map)
+each motor clipped to [MIN, MAX]                   # both modes
 ```
 
 | Variable | Example | Meaning |
 |----------|---------|---------|
-| `MOTOR_THRUST_MIN_N` | `0` | Thrust at action `-1` |
-| `MOTOR_THRUST_MAX_N` | `4` | Thrust at action `+1` |
+| `MOTOR_THRUST_MIN_N` | `0` | Minimum thrust per motor (N) |
+| `MOTOR_THRUST_MAX_N` | `3` | **Maximum thrust per motor (N)** — caps mixer roll/pitch/yaw mix too |
 
-Example: `MIN=0`, `MAX=4` → `-1→0 N`, `-0.5→1 N`, `0→2 N`, `0.5→3 N`, `1→4 N`.
+In **mixer** mode, `a0` still adjusts total thrust around m·g, but no motor exceeds `MOTOR_THRUST_MAX_N`.
+
+### Action mode (`NAV_ACTION_MODE`)
+
+The policy **always** outputs **4** numbers in `[-1, 1]` (Gym `Box(4,)`). What they mean depends on the mode:
+
+| Mode | `.env` | Action vector `[a0, a1, a2, a3]` |
+|------|--------|-------------------------------------|
+| **`motors`** (default) | `NAV_ACTION_MODE=motors` | **Four motor thrusts** — linear map via `MOTOR_THRUST_MIN_N` / `MOTOR_THRUST_MAX_N` |
+| **`mixer`** | `NAV_ACTION_MODE=mixer` | **`[thrust_delta, roll_mix, pitch_mix, yaw_mix]`** — total thrust ≈ m·g when `a0=0`; roll/pitch mix tilt; yaw differential |
+
+Mixer decode (`QuadNavEnv._decode_action_mixer`): `a0=0, a1=a2=a3=0` → hover float (~m·g/4 per motor). Not a 2-element action — still 4D, but only thrust/roll/pitch/yaw semantics instead of four independent thrusts.
+
+```env
+NAV_ACTION_MODE=motors   # or mixer
+```
+
+CLI override: `--action-mode mixer`. Must match the mode used when the checkpoint was trained.
+
+Try mixer manually: `python manual_mixer_demo.py --gui`
 
 ### GUI playback
 
@@ -89,10 +109,31 @@ Fixed **m·g/4** per motor (`--hover-balance`, default on in this script) so you
 
 Tune ranges in `.env` (`WIND_SPEED_MIN/MAX`, drag, turbulence, noise).
 
+## Manual mixer control (keyboard)
+
+PPO can use **`mixer`** action mode instead of four raw motor thrusts (`train_nav_rl.py --action-mode mixer`). The policy outputs total-thrust delta + roll/pitch/yaw mix; see `QuadNavEnv._decode_action_mixer()`.
+
+Try it yourself with the keyboard demo (same mixer decode as training):
+
+```bash
+python manual_mixer_demo.py --gui
+python manual_mixer_demo.py --gui --no-wind
+```
+
+| Key | Effect |
+|-----|--------|
+| **W / S** | Pitch command (forward / back) |
+| **A / D** | Roll command (left / right) |
+| **(release all)** | `[0,0,0,0]` → thrust ≈ m·g, no mix → **hover float** (~m·g/4 per motor) |
+| **ESC** | Quit |
+
+Click the PyBullet window so it receives key events.
+
 ## Training
 
 ```bash
 python train_nav_rl.py --timesteps 400000 --n-envs 8 --n-steps 1024 --batch-size 512
+python train_nav_rl.py --action-mode mixer   # roll/pitch mix instead of 4 motor thrusts
 ```
 
 Learning rate schedule (`.env` or CLI `--lr`, `--lr-schedule`, `--lr-final`):

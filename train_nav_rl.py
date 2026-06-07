@@ -25,6 +25,7 @@ from env_config import (
     describe_ppo_early_stop_settings,
     describe_ppo_learning_rate,
     load_motor_thrust_settings,
+    load_nav_action_mode,
     load_ppo_checkpoint_settings,
     load_ppo_early_stop_settings,
     load_ppo_eval_settings,
@@ -119,17 +120,18 @@ def train(args: argparse.Namespace) -> Path:
     )
     nav_cfg = build_nav_env_config(
         no_wind=args.no_wind,
-        action_mode=args.action_mode,
+        action_mode=load_nav_action_mode(action_mode=args.action_mode),
         motor_thrust_min=args.motor_thrust_min,
         motor_thrust_max=args.motor_thrust_max,
     )
+    print(f"Action mode: {nav_cfg.action_mode}")
     print(f"Wind: {describe_nav_wind_settings(nav_cfg, cli_no_wind=args.no_wind)}")
 
     vec_env = build_vec_env(
         args.n_envs,
         args.seed,
         no_wind=args.no_wind,
-        action_mode=args.action_mode,
+        action_mode=load_nav_action_mode(action_mode=args.action_mode),
         motor_thrust_min=args.motor_thrust_min,
         motor_thrust_max=args.motor_thrust_max,
     )
@@ -137,7 +139,7 @@ def train(args: argparse.Namespace) -> Path:
         1,
         args.seed + 1,
         no_wind=args.no_wind,
-        action_mode=args.action_mode,
+        action_mode=load_nav_action_mode(action_mode=args.action_mode),
         motor_thrust_min=args.motor_thrust_min,
         motor_thrust_max=args.motor_thrust_max,
     )
@@ -279,11 +281,13 @@ def evaluate(args: argparse.Namespace) -> None:
         gui=args.gui,
         step_sleep_s=args.sleep,
         no_wind=args.no_wind,
+        action_mode=load_nav_action_mode(action_mode=args.action_mode),
         motor_thrust_min=args.motor_thrust_min,
         motor_thrust_max=args.motor_thrust_max,
         gui_realtime=args.realtime,
         gui_fast=args.fast,
     )
+    print(f"Action mode: {cfg.action_mode}")
     print(f"Wind: {describe_nav_wind_settings(cfg, cli_no_wind=args.no_wind)}")
     if args.no_viz:
         cfg.show_wind_visualization = False
@@ -462,8 +466,8 @@ def main() -> None:
     parser.add_argument(
         "--action-mode",
         choices=("motors", "mixer"),
-        default="motors",
-        help="motors = 4 thrusts; mixer = thrust+attitude mix (easier)",
+        default=None,
+        help="motors = 4 thrusts; mixer = thrust+roll/pitch/yaw mix; default NAV_ACTION_MODE in .env",
     )
     parser.add_argument(
         "--motor-thrust-min",
