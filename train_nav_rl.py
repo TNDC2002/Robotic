@@ -4,7 +4,8 @@ Train PPO to fly from spawn to a random goal using ``QuadNavGymEnv``.
 Examples:
   python train_nav_rl.py
   python train_nav_rl.py --timesteps 500000 --n-envs 4
-  python train_nav_rl.py --eval --model runs/nav_ppo/best_model.zip --gui
+  python train_nav_rl.py --resume runs/nav_ppo/best/best_model.zip --timesteps 400000
+  python train_nav_rl.py --eval --model runs/nav_ppo/best/best_model.zip --gui
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from __future__ import annotations
 import project_env  # noqa: F401 — .env overrides shell before any config load
 
 import argparse
-import os
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +29,9 @@ from env_config import (
     load_ppo_early_stop_settings,
     load_ppo_eval_settings,
     load_ppo_lr_settings,
+    load_ppo_resume_settings,
+    describe_ppo_resume_settings,
+    resolve_model_zip_path,
 )
 from ppo_callbacks import StopTrainingOnEvalPatience
 from quad_nav_env import QuadNavEnv, QuadNavGymEnv, make_nav_env
@@ -68,6 +71,34 @@ def build_vec_env(
 
     # DummyVecEnv: one PyBullet client per env, reliable on Windows.
     return make_vec_env(_factory, n_envs=n_envs, seed=seed, vec_env_cls=DummyVecEnv)
+
+
+def _create_ppo(
+    vec_env,
+    *,
+    seed: int,
+    learning_rate,
+    n_steps: int,
+    batch_size: int,
+    gamma: float,
+    ent_coef: float,
+    tensorboard_log: str | None,
+):
+    from stable_baselines3 import PPO
+
+    return PPO(
+        "MlpPolicy",
+        vec_env,
+        verbose=1,
+        seed=seed,
+        learning_rate=learning_rate,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        gamma=gamma,
+        ent_coef=ent_coef,
+        clip_range=0.2,
+        tensorboard_log=tensorboard_log,
+    )
 
 
 def train(args: argparse.Namespace) -> Path:
@@ -143,19 +174,54 @@ def train(args: argparse.Namespace) -> Path:
     )
     print(f"Early stopping: {describe_ppo_early_stop_settings(early_stop_settings)}")
 
-    model = PPO(
-        "MlpPolicy",
-        vec_env,
-        verbose=1,
-        seed=args.seed,
-        learning_rate=learning_rate,
-        n_steps=args.n_steps,
-        batch_size=args.batch_size,
-        gamma=args.gamma,
-        ent_coef=args.ent_coef,
-        clip_range=0.2,
-        tensorboard_log=str(out_dir / "tb") if args.tensorboard else None,
+    resume_settings = load_ppo_resume_settings(
+        resume=args.resume,
+        load_optimizer=args.load_optimizer,
     )
+    print(f"Resume: {describe_ppo_resume_settings(resume_settings)}")
+
+    tb_log = str(out_dir / "tb") if args.tensorboard else None
+
+    if resume_settings.model_path is not None:
+        resume_path = resolve_model_zip_path(resume_settings.model_path)
+        checkpoint = PPO.load(str(resume_path), env=vec_env, print_system_info=False)
+        prev_timesteps = checkpoint.num_timesteps
+        if resume_settings.load_optimizer:
+            model = checkpoint
+            model.learning_rate = learning_rate
+            if args.tensorboard and model.tensorboard_log is None:
+                model.tensorboard_log = tb_log
+            print(
+                f"  loaded weights + optimizer from checkpoint "
+                f"(was {prev_timesteps:,} timesteps); training counter reset"
+            )
+        else:
+            model = _create_ppo(
+                vec_env,
+                seed=args.seed,
+                learning_rate=learning_rate,
+                n_steps=args.n_steps,
+                batch_size=args.batch_size,
+                gamma=args.gamma,
+                ent_coef=args.ent_coef,
+                tensorboard_log=tb_log,
+            )
+            model.policy.load_state_dict(checkpoint.policy.state_dict())
+            print(
+                f"  loaded policy weights only from checkpoint "
+                f"(was {prev_timesteps:,} timesteps); fresh optimizer; counter reset"
+            )
+    else:
+        model = _create_ppo(
+            vec_env,
+            seed=args.seed,
+            learning_rate=learning_rate,
+            n_steps=args.n_steps,
+            batch_size=args.batch_size,
+            gamma=args.gamma,
+            ent_coef=args.ent_coef,
+            tensorboard_log=tb_log,
+        )
 
     callbacks = []
     if ckpt_settings.save_ckpt:
@@ -186,7 +252,13 @@ def train(args: argparse.Namespace) -> Path:
         )
     )
 
-    model.learn(total_timesteps=args.timesteps, callback=callbacks, progress_bar=args.progress_bar)
+    model.learn(
+        total_timesteps=args.timesteps,
+        callback=callbacks,
+        progress_bar=args.progress_bar,
+        reset_num_timesteps=True,
+    )
+    print(f"Training finished at {model.num_timesteps:,} total timesteps")
     if ckpt_settings.save_final:
         final_path = out_dir / "final_model"
         model.save(final_path)
@@ -201,11 +273,7 @@ def train(args: argparse.Namespace) -> Path:
 def evaluate(args: argparse.Namespace) -> None:
     from stable_baselines3 import PPO
 
-    model_path = args.model
-    if not model_path.endswith(".zip"):
-        model_path += ".zip"
-    if not os.path.isfile(model_path):
-        raise FileNotFoundError(model_path)
+    model_path = str(resolve_model_zip_path(args.model))
 
     cfg = build_nav_env_config(
         gui=args.gui,
@@ -284,6 +352,19 @@ def main() -> None:
     parser.add_argument("--smoke", action="store_true", help="Random-action env smoke test")
     parser.add_argument("--gui", action="store_true", help="GUI during evaluation")
     parser.add_argument("--model", type=str, default="runs/nav_ppo/best/best_model.zip")
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Load checkpoint before training; default PPO_RESUME_MODEL in .env",
+    )
+    parser.add_argument(
+        "--load-optimizer",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="With --resume: also restore Adam state; default PPO_RESUME_LOAD_OPTIMIZER in .env",
+    )
     parser.add_argument("--output", type=str, default="runs/nav_ppo")
     parser.add_argument("--timesteps", type=int, default=400_000)
     parser.add_argument("--n-envs", type=int, default=4)

@@ -133,15 +133,34 @@ Disable wind for one run:
 python train_nav_rl.py --no-wind
 ```
 
+### Resume training
+
+Load a checkpoint before training. The **timestep counter always resets**; `--timesteps` is the full budget for this run.
+
+```env
+PPO_RESUME_MODEL=runs/nav_ppo/best/best_model.zip
+PPO_RESUME_LOAD_OPTIMIZER=0
+```
+
+| `PPO_RESUME_LOAD_OPTIMIZER` | Behavior |
+|-----------------------------|----------|
+| `0` (default) | **Policy weights only** — fresh optimizer, uses current `.env` / CLI hyperparams (`n-steps`, `batch-size`, LR, …) |
+| `1` | **Full checkpoint** — weights + Adam state (keeps saved `n_steps` / `batch_size` from the zip) |
+
+```bash
+python train_nav_rl.py --timesteps 4000000
+python train_nav_rl.py --resume runs/nav_ppo/final_model.zip --no-load-optimizer
+```
+
+Leave `PPO_RESUME_MODEL` empty to train from scratch. Observation size must match the saved model.
+
 ### Outputs
 
 - `runs/nav_ppo/ckpt/` — periodic checkpoints (when `PPO_SAVE_CKPT=1`)
 - `runs/nav_ppo/best/best_model.zip` — best eval model (when `PPO_SAVE_BEST=1`)
 - `runs/nav_ppo/final_model.zip` — model at end of training (when `PPO_SAVE_FINAL=1`)
 
-### Resume training
-
-No `--resume` flag; load a checkpoint with SB3 and `reset_num_timesteps=False` (see example in git history or SB3 docs).
+Use `--resume` or `PPO_RESUME_MODEL` in `.env` to continue from `best/` or `final_model.zip` (see **Resume training** above).
 
 ## Evaluation
 

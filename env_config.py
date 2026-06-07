@@ -386,6 +386,58 @@ def describe_ppo_learning_rate(settings: PpoLrSettings) -> str:
     return f"{settings.schedule} {settings.initial:g} → {settings.final:g}"
 
 
+def resolve_model_zip_path(path: str) -> Path:
+    """Normalize a SB3 ``.zip`` model path and verify the file exists."""
+    p = Path(path.strip())
+    if p.suffix.lower() != ".zip":
+        p = Path(f"{p}.zip")
+    if not p.is_file():
+        raise FileNotFoundError(p)
+    return p
+
+
+def load_ppo_resume_model(*, resume: str | None = None) -> str | None:
+    """Optional checkpoint path from ``PPO_RESUME_MODEL`` or CLI ``--resume``."""
+    return load_ppo_resume_settings(resume=resume).model_path
+
+
+@dataclass(frozen=True)
+class PpoResumeSettings:
+    """Resume training: load policy weights; timestep counter always resets."""
+
+    model_path: str | None
+    load_optimizer: bool
+
+
+def load_ppo_resume_settings(
+    *,
+    resume: str | None = None,
+    load_optimizer: bool | None = None,
+) -> PpoResumeSettings:
+    """Read resume path and optimizer flag from CLI / ``PPO_RESUME_*`` env vars."""
+    if resume is not None:
+        raw = resume.strip()
+        path = None if not raw else raw
+    else:
+        raw = os.getenv("PPO_RESUME_MODEL")
+        path = None if raw is None or not str(raw).strip() else str(raw).strip()
+    return PpoResumeSettings(
+        model_path=path,
+        load_optimizer=(
+            load_optimizer
+            if load_optimizer is not None
+            else _parse_bool("PPO_RESUME_LOAD_OPTIMIZER", False)
+        ),
+    )
+
+
+def describe_ppo_resume_settings(settings: PpoResumeSettings) -> str:
+    if settings.model_path is None:
+        return "disabled (train from scratch)"
+    opt = "weights + optimizer" if settings.load_optimizer else "weights only (fresh optimizer)"
+    return f"{settings.model_path} ({opt}, timesteps reset)"
+
+
 @dataclass(frozen=True)
 class PpoCheckpointSettings:
     """Which PPO artifacts to write under ``runs/nav_ppo/`` during training."""
