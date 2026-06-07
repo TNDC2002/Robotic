@@ -7,6 +7,8 @@ Used by navigation (train/eval), hover demo, and inference. Set ``WIND_ENABLED=0
 
 from __future__ import annotations
 
+import project_env  # noqa: F401 — load .env before os.getenv below
+
 import math
 import os
 from dataclasses import dataclass

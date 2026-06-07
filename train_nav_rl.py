@@ -9,6 +9,8 @@ Examples:
 
 from __future__ import annotations
 
+import project_env  # noqa: F401 — .env overrides shell before any config load
+
 import argparse
 import os
 from pathlib import Path
@@ -20,11 +22,15 @@ from env_config import (
     build_ppo_learning_rate,
     describe_nav_wind_settings,
     describe_ppo_checkpoint_settings,
+    describe_ppo_early_stop_settings,
     describe_ppo_learning_rate,
     load_motor_thrust_settings,
     load_ppo_checkpoint_settings,
+    load_ppo_early_stop_settings,
+    load_ppo_eval_settings,
     load_ppo_lr_settings,
 )
+from ppo_callbacks import StopTrainingOnEvalPatience
 from quad_nav_env import QuadNavEnv, QuadNavGymEnv, make_nav_env
 
 
@@ -121,6 +127,22 @@ def train(args: argparse.Namespace) -> Path:
     )
     print(f"Model saves: {describe_ppo_checkpoint_settings(ckpt_settings)}")
 
+    eval_settings = load_ppo_eval_settings(
+        eval_freq=args.eval_freq,
+        n_eval_episodes=args.eval_episodes,
+    )
+    early_stop_settings = load_ppo_early_stop_settings(
+        early_stop=args.early_stop,
+        patience=args.early_stop_patience,
+        min_delta=args.early_stop_min_delta,
+        min_evals=args.early_stop_min_evals,
+    )
+    print(
+        f"Eval: every {eval_settings.eval_freq:,} timesteps, "
+        f"{eval_settings.n_eval_episodes} episodes"
+    )
+    print(f"Early stopping: {describe_ppo_early_stop_settings(early_stop_settings)}")
+
     model = PPO(
         "MlpPolicy",
         vec_env,
@@ -143,14 +165,24 @@ def train(args: argparse.Namespace) -> Path:
                 save_path=str(out_dir / "ckpt"),
             )
         )
+    early_stop_cb = None
+    if early_stop_settings.enabled:
+        early_stop_cb = StopTrainingOnEvalPatience(
+            patience=early_stop_settings.patience,
+            min_delta=early_stop_settings.min_delta,
+            min_evals=early_stop_settings.min_evals,
+            verbose=1,
+        )
+
     callbacks.append(
         EvalCallback(
             eval_env,
             best_model_save_path=str(out_dir / "best") if ckpt_settings.save_best else None,
             log_path=str(out_dir / "eval"),
-            eval_freq=max(args.eval_freq // args.n_envs, 1),
-            n_eval_episodes=args.eval_episodes,
+            eval_freq=max(eval_settings.eval_freq // args.n_envs, 1),
+            n_eval_episodes=eval_settings.n_eval_episodes,
             deterministic=True,
+            callback_after_eval=early_stop_cb,
         )
     )
 
@@ -219,8 +251,12 @@ def evaluate(args: argparse.Namespace) -> None:
             successes += 1
         elif reason == "crash":
             crashes += 1
+        elif reason == "unsafe_attitude":
+            crashes += 1
+        tilt = info.get("tilt_deg")
+        tilt_s = f"  tilt={tilt:.1f}°" if tilt is not None else ""
         print(
-            f"Episode {ep + 1}: {reason}  reward={total_r:+.1f}  "
+            f"Episode {ep + 1}: {reason}  reward={total_r:+.1f}{tilt_s}  "
             f"dist={info.get('distance_to_goal', 0):.3f} m  goal={info.get('goal')}"
         )
     env.close()
@@ -298,9 +334,43 @@ def main() -> None:
         default=None,
         help="Save final_model.zip at end; default PPO_SAVE_FINAL in .env",
     )
-    parser.add_argument("--eval-freq", type=int, default=20_000)
-    parser.add_argument("--eval-episodes", type=int, default=5)
-    parser.add_argument("--episodes", type=int, default=5, help="Eval episode count")
+    parser.add_argument(
+        "--eval-freq",
+        type=int,
+        default=None,
+        help="Eval every N timesteps; default PPO_EVAL_FREQ in .env (20000)",
+    )
+    parser.add_argument(
+        "--eval-episodes",
+        type=int,
+        default=None,
+        help="Episodes per eval round; default PPO_EVAL_EPISODES in .env (5)",
+    )
+    parser.add_argument(
+        "--early-stop",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Stop when eval reward plateaus; default PPO_EARLY_STOP in .env",
+    )
+    parser.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=None,
+        help="Eval rounds without improvement before stop; default PPO_EARLY_STOP_PATIENCE",
+    )
+    parser.add_argument(
+        "--early-stop-min-delta",
+        type=float,
+        default=None,
+        help="Min eval reward gain to count as improvement; default PPO_EARLY_STOP_MIN_DELTA",
+    )
+    parser.add_argument(
+        "--early-stop-min-evals",
+        type=int,
+        default=None,
+        help="Min eval rounds before early stop can trigger; default PPO_EARLY_STOP_MIN_EVALS",
+    )
+    parser.add_argument("--episodes", type=int, default=5, help="Eval episode count (manual --eval mode)")
     parser.add_argument("--tensorboard", action="store_true")
     parser.add_argument("--progress-bar", action="store_true", help="Requires tqdm and rich")
     parser.add_argument(

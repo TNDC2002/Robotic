@@ -1,8 +1,12 @@
 """
 Navigate a quadrotor from a fixed spawn to a random goal on a bounded map.
 
-Episode ends on floor crash (low altitude), reaching the goal, or time limit.
-Exceeding the safe tilt angle (``SAFE_ATTITUDE_DEG`` in ``.env``, default 70°) adds a per-step penalty but does not end the episode.
+Episode ends on floor crash (low altitude), reaching the goal, or time limit (optional: excessive tilt).
+
+``SAFE_ATTITUDE_DEG`` is the maximum **tilt from vertical**: angle between body +Z and world +Z
+(``tilt_deg = acos(uprightness)``), not independent Euler roll/pitch limits.
+Exceeding it adds a per-step penalty; staying within earns a per-step bonus.
+Set ``NAV_END_ON_UNSAFE_ATTITUDE=1`` in ``.env`` to end the episode on excessive tilt.
 
 **Actions** (``action_mode``):
 
@@ -23,7 +27,10 @@ from typing import Any, Literal
 import numpy as np
 import pybullet as p
 
-from quad_drone_sim import HOVER_Z, MASS, allocate_motor_thrusts
+from quad_drone_sim import MASS, allocate_motor_thrusts
+
+# Nav spawn is higher than hover demo default to give more altitude margin before floor crash.
+DEFAULT_NAV_SPAWN_Z = 1.25
 from quad_hover_env import DT, EnvConfig, QuadHoverEnv, WindConfig
 from wind_settings import load_wind_settings, sample_episode_wind
 
@@ -58,9 +65,9 @@ class NavMapConfig:
     x_max: float = 8.0
     y_min: float = -8.0
     y_max: float = 8.0
-    cruise_z: float = HOVER_Z
+    cruise_z: float = DEFAULT_NAV_SPAWN_Z
     z_min: float = 0.35
-    z_max: float = 1.15
+    z_max: float = 1.65
 
 
 @dataclass
@@ -69,10 +76,12 @@ class NavEnvConfig(EnvConfig):
 
     map: NavMapConfig = field(default_factory=NavMapConfig)
     spawn_xy: tuple[float, float] = (0.0, 0.0)
-    spawn_z: float = HOVER_Z
+    spawn_z: float = DEFAULT_NAV_SPAWN_Z
     min_goal_distance: float = 2.5
     goal_radius: float = 0.32
     goal_z_tolerance: float = 0.25
+    # Goal altitude is sampled in [spawn_z, spawn_z + goal_z_max_rise] (never below spawn).
+    goal_z_max_rise: float = 0.35
     frame_skip: int = 4  # physics substeps per agent step
     max_episode_steps: int = 14_400  # physics steps ≈ 60 s at 240 Hz
     action_mode: Literal["motors", "mixer"] = "motors"
@@ -97,10 +106,13 @@ class NavEnvConfig(EnvConfig):
     w_lin_vel: float = 0.04
     w_upright: float = 0.15
     w_action_rate: float = 0.02
-    w_unsafe_attitude: float = 5.0  # per substep when |roll| or |pitch| >= flip_angle_rad
+    w_unsafe_attitude: float = 5.0  # per substep when tilt >= flip_angle_rad
+    w_safe_attitude: float = 1.0  # per substep when tilt < flip_angle_rad
     success_bonus: float = 120.0
     crash_penalty: float = 80.0
     time_limit_penalty: float = 15.0
+    end_on_unsafe_attitude: bool = False  # terminate when tilt >= SAFE_ATTITUDE_DEG
+    penalty_unsafe_attitude_end: float = 50.0  # terminal penalty if end_on_unsafe_attitude
     show_goal_marker: bool = True
 
 
@@ -146,20 +158,26 @@ class QuadNavEnv(QuadHoverEnv):
         self._wind_rng = random.Random(self.cfg.wind.seed)
         self._sync_wind_visualize_flag()
 
+    def _goal_z_range(self) -> tuple[float, float]:
+        spawn_z = self.nav.spawn_z
+        gz_lo = spawn_z
+        gz_hi = min(self.nav.map.z_max, spawn_z + self.nav.goal_z_max_rise)
+        if gz_hi < gz_lo:
+            gz_hi = gz_lo
+        return gz_lo, gz_hi
+
     def _sample_goal(self) -> tuple[float, float, float]:
         m = self.nav.map
-        sx, sy = self._spawn_pos[0], self._spawn_pos[1]
+        sx, sy = self.nav.spawn_xy
+        gz_lo, gz_hi = self._goal_z_range()
         for _ in range(64):
             gx = self._episode_rng.uniform(m.x_min, m.x_max)
             gy = self._episode_rng.uniform(m.y_min, m.y_max)
-            gz = self._episode_rng.uniform(
-                max(m.z_min, m.cruise_z - self.nav.goal_z_tolerance),
-                min(m.z_max, m.cruise_z + self.nav.goal_z_tolerance),
-            )
+            gz = self._episode_rng.uniform(gz_lo, gz_hi)
             if math.hypot(gx - sx, gy - sy) >= self.nav.min_goal_distance:
                 return (gx, gy, gz)
         # Fallback: point along +X if sampling fails.
-        return (sx + self.nav.min_goal_distance, sy, m.cruise_z)
+        return (sx + self.nav.min_goal_distance, sy, gz_lo)
 
     def _goal_distance(self, pos: tuple[float, float, float]) -> float:
         return math.sqrt(
@@ -200,12 +218,12 @@ class QuadNavEnv(QuadHoverEnv):
             self._episode_rng = np.random.default_rng(seed)
         elif self.nav.wind_settings is not None and self.nav.wind_settings.seed is not None:
             self._episode_rng = np.random.default_rng(self.nav.wind_settings.seed)
-        self._goal_pos = self._sample_goal()
         self._spawn_pos = (
             self.nav.spawn_xy[0],
             self.nav.spawn_xy[1],
             self.nav.spawn_z,
         )
+        self._goal_pos = self._sample_goal()
         spawn = pos if pos is not None else self._spawn_pos
         state = super().reset(pos=spawn, orn=orn)
         self._clear_force_visualization()
@@ -254,6 +272,11 @@ class QuadNavEnv(QuadHoverEnv):
             wx, wy, wz = self._effective_wind_velocity(self._step_count * DT)
             obs.extend([wx, wy, wz])
         return np.array(obs, dtype=np.float32)
+
+    @staticmethod
+    def tilt_rad_from_uprightness(uprightness: float) -> float:
+        """Angle (rad) between body +Z and world +Z; 0 = level, pi = inverted."""
+        return math.acos(max(-1.0, min(1.0, uprightness)))
 
     @staticmethod
     def _uprightness_from_orn(orn: tuple[float, float, float, float]) -> float:
@@ -350,26 +373,32 @@ class QuadNavEnv(QuadHoverEnv):
         alt_progress = self._prev_goal_alt_err - alt_err
         self._prev_goal_alt_err = alt_err
 
+        tilt_rad = self.tilt_rad_from_uprightness(uprightness)
+
         parts = {
             "progress": self.nav.w_progress * progress,
             "goal_dist": -self.nav.w_goal_dist * dist,
             "goal_alt": -self.nav.w_goal_alt * alt_err,
             "goal_alt_progress": self.nav.w_goal_alt_progress * alt_progress,
             "alive": self.nav.w_alive,
-            "attitude": -self.nav.w_attitude * (abs(roll) + abs(pitch)),
+            "attitude": -self.nav.w_attitude * tilt_rad,
             "ang_vel": -self.nav.w_ang_vel * math.sqrt(sum(w * w for w in ang_vel)),
             "lin_vel": -self.nav.w_lin_vel * math.sqrt(sum(v * v for v in lin_vel)),
             "upright": self.nav.w_upright * max(0.0, uprightness),
             "action_rate": -self.nav.w_action_rate * float(np.sum((action - self._prev_action) ** 2)),
         }
-        if self._attitude_unsafe(roll, pitch):
+        if self._attitude_unsafe(uprightness):
             parts["unsafe_attitude"] = -self.nav.w_unsafe_attitude
+        else:
+            parts["safe_attitude"] = self.nav.w_safe_attitude
         terminal = 0.0
         if done:
             if terminal_reason == "success":
                 terminal = self.nav.success_bonus
             elif terminal_reason == "crash":
                 terminal = -self.nav.crash_penalty
+            elif terminal_reason == "unsafe_attitude":
+                terminal = -self.nav.penalty_unsafe_attitude_end
             elif terminal_reason == "time_limit":
                 terminal = -self.nav.time_limit_penalty
         parts["terminal"] = terminal
@@ -396,7 +425,7 @@ class QuadNavEnv(QuadHoverEnv):
             lin_vel, ang_vel = p.getBaseVelocity(self._drone)
             roll, pitch, yaw = p.getEulerFromQuaternion(orn)
             uprightness = self._uprightness_from_orn(orn)
-            done, terminal_reason = self._check_termination_simple(pos)
+            done, terminal_reason = self._check_termination_simple(pos, uprightness=uprightness)
             step_reward, last_parts = self._compute_nav_reward(
                 pos=pos,
                 roll=roll,
@@ -432,7 +461,9 @@ class QuadNavEnv(QuadHoverEnv):
                 if self.cfg.hover_balance_thrust
                 else self._decode_action(action_arr)
             ),
-            "unsafe_attitude": self._attitude_unsafe(roll, pitch),
+            "unsafe_attitude": self._attitude_unsafe(uprightness),
+            "tilt_deg": math.degrees(self.tilt_rad_from_uprightness(uprightness)),
+            "uprightness": uprightness,
         }
         if self._last_wind_info is not None:
             info["wind"] = self._last_wind_info
@@ -445,16 +476,22 @@ class QuadNavEnv(QuadHoverEnv):
             }
         return obs, total_reward, done, info
 
-    def _attitude_unsafe(self, roll: float, pitch: float) -> bool:
-        limit = self.cfg.flip_angle_rad
-        return abs(roll) >= limit or abs(pitch) >= limit
+    def _attitude_unsafe(self, uprightness: float) -> bool:
+        return self.tilt_rad_from_uprightness(uprightness) >= self.cfg.flip_angle_rad
 
     def _check_termination_simple(
         self,
         pos: tuple[float, float, float],
+        *,
+        uprightness: float,
     ) -> tuple[bool, str | None]:
         if pos[2] <= self.cfg.crash_z:
             return True, "crash"
+        if (
+            self.nav.end_on_unsafe_attitude
+            and self.tilt_rad_from_uprightness(uprightness) >= self.cfg.flip_angle_rad
+        ):
+            return True, "unsafe_attitude"
         dist_xy = math.hypot(pos[0] - self._goal_pos[0], pos[1] - self._goal_pos[1])
         dist_z = abs(pos[2] - self._goal_pos[2])
         if dist_xy <= self.nav.goal_radius and dist_z <= self.nav.goal_z_tolerance:

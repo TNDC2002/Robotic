@@ -64,14 +64,16 @@ python rl_interact_demo.py --gui --no-wind
 
 See `.env.example` for defaults.
 
+**Config priority:** explicit CLI flags (when you pass them) → **`.env`** (overrides shell/conda env) → code defaults. Restart training after editing `.env`.
+
 ### Navigation reward weights
 
-Tune PPO shaping via `REWARD_*` in `.env` (see [REWARD.md](REWARD.md) for formulas):
+Tune PPO shaping via `REWARD_*` (bonuses) and `PENALTY_*` (costs) in `.env` (see [REWARD.md](REWARD.md) for formulas):
 
 ```env
 REWARD_W_PROGRESS=8.0
 REWARD_SUCCESS_BONUS=120.0
-REWARD_CRASH_PENALTY=80.0
+PENALTY_CRASH=80.0
 ```
 
 ## Wind-tunnel / hover-balance preview
@@ -111,6 +113,19 @@ PPO_CKPT_FREQ=50000      # timesteps between ckpt saves
 PPO_SAVE_BEST=1          # best/ from eval callback
 PPO_SAVE_FINAL=1         # final_model.zip at end
 ```
+
+Eval + early stopping (optional; uses the same eval env as `best/` saves):
+
+```env
+PPO_EVAL_FREQ=20000           # timesteps between eval rounds
+PPO_EVAL_EPISODES=5           # episodes averaged per eval
+PPO_EARLY_STOP=1              # 1 = stop when eval reward plateaus
+PPO_EARLY_STOP_PATIENCE=5     # eval rounds without improvement
+PPO_EARLY_STOP_MIN_DELTA=0.0  # minimum reward gain to reset patience
+PPO_EARLY_STOP_MIN_EVALS=3    # warmup evals before stop can trigger
+```
+
+RL does not require early stopping, but it saves time when the policy has plateaued. Keep `PPO_SAVE_BEST=1` so the best checkpoint is kept even if training stops early.
 
 Disable wind for one run:
 

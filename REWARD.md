@@ -18,7 +18,7 @@ Implemented in `QuadNavEnv._compute_nav_reward()`. Each **physics substep** (240
 ### Total per substep
 
 ```text
-R = progress + goal_dist + goal_alt + goal_alt_progress + alive + attitude + ang_vel + lin_vel + upright + action_rate + unsafe_attitude + terminal
+R = progress + goal_dist + goal_alt + goal_alt_progress + alive + attitude + ang_vel + lin_vel + upright + action_rate + safe_attitude + unsafe_attitude + terminal
 ```
 
 `terminal` is non-zero only on the substep where the episode ends.
@@ -32,12 +32,13 @@ R = progress + goal_dist + goal_alt + goal_alt_progress + alive + attitude + ang
 | **goal_alt** | `−w_goal_alt × |z − z_goal|` | `1.0` | − | Penalize vertical offset from the **goal altitude** (m). |
 | **goal_alt_progress** | `w_goal_alt_progress × (e_prev − e_now)` | `4.0` | ± | Reward **closing** vertical gap; `e = |z − z_goal|`. Mirrors `progress` but altitude-only. |
 | **alive** | `+w_alive` | `0.02` | + | Constant per-substep bonus for surviving. Encourages not crashing. |
-| **attitude** | `−w_attitude × (|roll| + |pitch|)` | `1.2` | − | Penalize tilt. Keeps the drone relatively level while navigating. |
+| **attitude** | `−w_attitude × tilt_rad` | `1.2` | − | Penalize tilt from vertical; `tilt_rad = acos(uprightness)`. |
 | **ang_vel** | `−w_ang_vel × ‖ω‖` | `0.06` | − | Penalize angular velocity (rad/s). Reduces spinning and wobble. |
 | **lin_vel** | `−w_lin_vel × ‖v‖` | `0.04` | − | Penalize linear speed (m/s). Encourages smoother, less frantic flight. |
-| **upright** | `+w_upright × max(0, uprightness)` | `0.15` | + | Bonus when body +Z aligns with world +Z (`uprightness` ∈ [−1, 1]). |
+| **upright** | `+w_upright × max(0, uprightness)` | `0.15` | + | Bonus when body +Z aligns with world +Z (`uprightness` = cos(tilt)). |
 | **action_rate** | `−w_action_rate × Σ(a − a_prev)²` | `0.02` | − | Penalize large changes in the 4D action vector. Smoother motor commands. |
-| **unsafe_attitude** | `−w_unsafe_attitude` when \|roll\| or \|pitch\| ≥ safe limit (~70°) | `5.0` | − | Extra per-substep penalty while tilted past the safe angle. Episode **continues** (no terminal). |
+| **safe_attitude** | `+w_safe_attitude` when `tilt_deg < SAFE_ATTITUDE_DEG` | `1.0` | + | Per-substep bonus for staying within the safe tilt envelope. |
+| **unsafe_attitude** | `−w_unsafe_attitude` when `tilt_deg ≥ SAFE_ATTITUDE_DEG` | `5.0` | − | Extra per-substep penalty while tilted past the safe angle. Episode **continues** unless `NAV_END_ON_UNSAFE_ATTITUDE=1`. |
 | **terminal** | see below | — | ± | One-shot bonus or penalty when the episode ends. |
 
 **Variables**
@@ -45,7 +46,9 @@ R = progress + goal_dist + goal_alt + goal_alt_progress + alive + attitude + ang
 - `d_now`, `d_prev`: distance from drone to goal (m).
 - `z`, `z_goal`: drone and goal altitude (m).
 - `e_now`, `e_prev`: `|z − z_goal|` (m).
-- `roll`, `pitch`: body orientation (rad).
+- `roll`, `pitch`: body Euler angles (rad) — in observations only; rewards use **tilt from vertical**.
+- `uprightness`: cos(tilt) = body +Z · world +Z; 1 = level, 0 = 90° bank, −1 = inverted.
+- `tilt_deg`: `acos(uprightness)` in degrees — matches `SAFE_ATTITUDE_DEG`.
 - `v`: linear velocity `(vx, vy, vz)` (m/s).
 - `ω`: angular velocity `(wx, wy, wz)` (rad/s).
 - `a`: current action in `[−1, 1]⁴`; `a_prev` is the action from the previous RL step.
@@ -60,7 +63,9 @@ Applied once when `done=True` on that substep:
 | `crash` | Altitude ≤ `crash_z` (0.12 m) — floor impact only | **−80** |
 | `time_limit` | Physics step count ≥ `max_episode_steps` (14 400 ≈ 60 s) | **−15** |
 
-Tilt past `SAFE_ATTITUDE_DEG` (default 70°, stored as `flip_angle_rad`) does **not** end the episode; it applies `unsafe_attitude` each substep until the drone recovers or hits the floor.
+Tilt past `SAFE_ATTITUDE_DEG` applies `unsafe_attitude` each substep until the drone recovers or the episode ends. While within the limit, `safe_attitude` applies instead. Set `NAV_END_ON_UNSAFE_ATTITUDE=1` to terminate immediately (terminal penalty `PENALTY_UNSAFE_ATTITUDE_END`).
+
+**Important:** `SAFE_ATTITUDE_DEG` is **tilt from vertical** (body +Z vs world +Z), not separate roll/pitch caps.
 
 ### Episode flow and scaling
 
@@ -83,29 +88,44 @@ Over a 60 s episode at 240 Hz with 4× frame skip, there are up to **3 600 RL 
 
 ### Default weights (config)
 
-All weights live on `NavEnvConfig` in `quad_nav_env.py` and can be set in **`.env`** (loaded by `env_config.load_nav_reward_settings()`):
+All weights live on `NavEnvConfig` in `quad_nav_env.py` and can be set in **`.env`** (loaded by `env_config.load_nav_reward_settings()`). Use **`REWARD_*`** for bonuses and **`PENALTY_*`** for costs (legacy `REWARD_W_*` penalty names still work as fallbacks).
+
+**Rewards (`REWARD_*`)**
 
 | `.env` variable | Config field | Default |
 |-----------------|--------------|---------|
 | `REWARD_W_PROGRESS` | `w_progress` | `8.0` |
-| `REWARD_W_GOAL_DIST` | `w_goal_dist` | `0.4` |
-| `REWARD_W_GOAL_ALT` | `w_goal_alt` | `1.0` |
 | `REWARD_W_GOAL_ALT_PROGRESS` | `w_goal_alt_progress` | `4.0` |
 | `REWARD_W_ALIVE` | `w_alive` | `0.02` |
-| `REWARD_W_ATTITUDE` | `w_attitude` | `1.2` |
-| `REWARD_W_ANG_VEL` | `w_ang_vel` | `0.06` |
-| `REWARD_W_LIN_VEL` | `w_lin_vel` | `0.04` |
 | `REWARD_W_UPRIGHT` | `w_upright` | `0.15` |
-| `REWARD_W_ACTION_RATE` | `w_action_rate` | `0.02` |
-| `REWARD_W_UNSAFE_ATTITUDE` | `w_unsafe_attitude` | `5.0` |
+| `REWARD_W_SAFE_ATTITUDE` | `w_safe_attitude` | `1.0` |
 | `REWARD_SUCCESS_BONUS` | `success_bonus` | `120.0` |
-| `REWARD_CRASH_PENALTY` | `crash_penalty` | `80.0` |
-| `REWARD_TIME_LIMIT_PENALTY` | `time_limit_penalty` | `15.0` |
+
+**Penalties (`PENALTY_*`)**
+
+| `.env` variable | Config field | Default |
+|-----------------|--------------|---------|
+| `PENALTY_W_GOAL_DIST` | `w_goal_dist` | `0.4` |
+| `PENALTY_W_GOAL_ALT` | `w_goal_alt` | `1.0` |
+| `PENALTY_W_ATTITUDE` | `w_attitude` | `1.2` |
+| `PENALTY_W_ANG_VEL` | `w_ang_vel` | `0.06` |
+| `PENALTY_W_LIN_VEL` | `w_lin_vel` | `0.04` |
+| `PENALTY_W_ACTION_RATE` | `w_action_rate` | `0.02` |
+| `PENALTY_W_UNSAFE_ATTITUDE` | `w_unsafe_attitude` | `5.0` |
+| `PENALTY_UNSAFE_ATTITUDE_END` | `penalty_unsafe_attitude_end` | `50.0` |
+| `NAV_END_ON_UNSAFE_ATTITUDE` | `end_on_unsafe_attitude` | `0` |
+| `PENALTY_CRASH` | `crash_penalty` | `80.0` |
+| `PENALTY_TIME_LIMIT` | `time_limit_penalty` | `15.0` |
+
+**Other**
+
+| `.env` variable | Config field | Default |
+|-----------------|--------------|---------|
 | `SAFE_ATTITUDE_DEG` | `flip_angle_rad` (converted to rad) | `70` |
 
 Training and eval via `build_nav_env_config()` pick these up automatically. Restart training after changing reward weights.
 
-**Safe tilt:** when `|roll|` or `|pitch|` ≥ `SAFE_ATTITUDE_DEG`, the `unsafe_attitude` penalty applies each substep; the episode does not end until floor crash, success, or time limit.
+**Safe tilt:** when `tilt_deg = acos(uprightness)` is below `SAFE_ATTITUDE_DEG`, the `safe_attitude` bonus applies each substep. When tilt reaches the limit, `unsafe_attitude` replaces it. Optional: `NAV_END_ON_UNSAFE_ATTITUDE=1` ends the episode on excessive tilt.
 
 ### What the agent is encouraged to do (summary)
 
@@ -173,8 +193,9 @@ Stable-Baselines3 PPO maximizes **discounted return** `Σ γ^t r_t` with `gamma=
 ```text
 success     : ‖pos_xy − goal_xy‖ ≤ 0.32 m  AND  |pos_z − goal_z| ≤ 0.25 m
 crash       : z ≤ 0.12 m (floor only)
-unsafe tilt : |roll| or |pitch| ≥ SAFE_ATTITUDE_DEG (default 70°) → per-step penalty, episode continues
+unsafe tilt : tilt_deg ≥ SAFE_ATTITUDE_DEG → per-step penalty; optional episode end (NAV_END_ON_UNSAFE_ATTITUDE=1)
+safe tilt   : tilt_deg < SAFE_ATTITUDE_DEG → per-step bonus
 time_limit  : step ≥ 14_400 physics steps (~60 s)
 ```
 
-Goal is sampled each episode at least `min_goal_distance` (2.5 m) from spawn, inside the map bounds (`±8 m` XY, cruise altitude ~0.75 m).
+Goal is sampled each episode at least `min_goal_distance` (2.5 m) from spawn, inside the map bounds (`±8 m` XY). Goal altitude is always **≥ spawn altitude**, uniformly in `[spawn_z, spawn_z + goal_z_max_rise]` (default spawn 1.25 m, rise up to 0.35 m).
