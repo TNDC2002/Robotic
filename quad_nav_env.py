@@ -554,6 +554,7 @@ try:
         def __init__(self, config: NavEnvConfig | None = None, render_mode: str | None = None):
             super().__init__()
             self._env = QuadNavEnv(config)
+            self._completed_outcomes: list[dict[str, Any]] = []
             self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(4,), dtype=np.float32)
             self.observation_space = spaces.Box(
                 low=-np.inf,
@@ -580,7 +581,16 @@ try:
         def step(self, action):
             obs, reward, terminated, info = self._env.step(action)
             truncated = info.get("terminal_reason") == "time_limit"
+            if terminated or truncated:
+                self._completed_outcomes.append(
+                    {"terminal_reason": info.get("terminal_reason")}
+                )
             return obs, reward, terminated, truncated, info
+
+        def drain_completed_outcomes(self) -> list[dict[str, Any]]:
+            outcomes = self._completed_outcomes
+            self._completed_outcomes = []
+            return outcomes
 
         def close(self):
             self._env.close()

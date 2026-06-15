@@ -54,6 +54,7 @@ def run_episode(
     step_sleep_s: float,
     no_wind: bool = False,
     hover_balance: bool = True,
+    wind_viz_raw: bool = False,
 ) -> None:
     from env_config import build_nav_env_config, hover_thrust_per_motor_n
     from wind_settings import describe_sampled_wind, describe_wind_settings
@@ -65,6 +66,7 @@ def run_episode(
         hover_balance=hover_balance,
         gui_unlimited=True,
         episode_seconds=episode_seconds,
+        wind_viz_raw=wind_viz_raw,
     )
     if max_steps is not None:
         cfg.max_episode_steps = max_steps
@@ -94,6 +96,12 @@ def run_episode(
         )
     else:
         print("  Mode: neutral motor action (0) — use --hover-balance for wind-tunnel view")
+    if cfg.force_viz_wind_mode == "wind_ms":
+        print(
+            f"  Wind viz: raw air velocity (m/s), scale={cfg.force_viz_length_per_ms} m per (m/s)"
+        )
+    else:
+        print("  Wind viz: drag force (N)")
     print(f"  Goal (nav task): {env._goal_pos}")
     print(f"  Observation size: {env.observation_size} floats")
     print()
@@ -186,6 +194,11 @@ def main() -> None:
         action="store_true",
         help="Disable wind (overrides WIND_ENABLED in .env)",
     )
+    parser.add_argument(
+        "--wind-viz-raw",
+        action="store_true",
+        help="Show wind as air velocity (m/s) instead of drag (N); longer arrows",
+    )
     args = parser.parse_args()
     if args.steps is not None and args.seconds is not None:
         parser.error("Use only one of --steps or --seconds")
@@ -218,6 +231,7 @@ def main() -> None:
         step_sleep_s=step_sleep_s,
         no_wind=args.no_wind,
         hover_balance=hover_balance,
+        wind_viz_raw=args.wind_viz_raw,
     )
 
 

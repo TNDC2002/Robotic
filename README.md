@@ -200,6 +200,7 @@ Leave `PPO_RESUME_MODEL` empty to train from scratch. Observation size must matc
 - `runs/nav_ppo/ckpt/` — periodic checkpoints (when `PPO_SAVE_CKPT=1`)
 - `runs/nav_ppo/best/best_model.zip` — best eval model (when `PPO_SAVE_BEST=1`)
 - `runs/nav_ppo/final_model.zip` — model at end of training (when `PPO_SAVE_FINAL=1`)
+- `runs/nav_ppo/metrics.csv` — rollout + eval metrics for plotting (`python plot_training_metrics.py`)
 
 Use `--resume` or `PPO_RESUME_MODEL` in `.env` to continue from `best/` or `final_model.zip` (see **Resume training** above).
 

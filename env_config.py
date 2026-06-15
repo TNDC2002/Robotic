@@ -132,6 +132,34 @@ def load_hover_balance_mode(*, cli_flag: bool | None = None, default: bool = Fal
     return _parse_bool("HOVER_BALANCE_MODE", default)
 
 
+ForceVizWindMode = Literal["drag_n", "wind_ms"]
+
+
+def load_force_viz_wind_mode(*, cli_raw: bool | None = None) -> ForceVizWindMode:
+    """Wind arrow mode: ``drag_n`` (Newtons) or ``wind_ms`` (air velocity, longer arrows)."""
+    if cli_raw is True:
+        return "wind_ms"
+    if cli_raw is False:
+        return "drag_n"
+    mode = _env_str("FORCE_VIZ_WIND_MODE", "drag_n").strip().lower()
+    if mode not in ("drag_n", "wind_ms"):
+        raise ValueError(f"FORCE_VIZ_WIND_MODE must be drag_n or wind_ms, got {mode!r}")
+    return mode  # type: ignore[return-value]
+
+
+def apply_force_viz_settings(
+    cfg: "EnvConfig | NavEnvConfig",
+    *,
+    wind_viz_raw: bool | None = None,
+) -> None:
+    from quad_hover_env import EnvConfig
+
+    cfg.force_viz_wind_mode = load_force_viz_wind_mode(cli_raw=wind_viz_raw)
+    cfg.force_viz_length_per_ms = _env_float("FORCE_VIZ_LENGTH_PER_MS", cfg.force_viz_length_per_ms)
+    if isinstance(cfg, EnvConfig):
+        cfg.force_viz_length_per_n = _env_float("FORCE_VIZ_LENGTH_PER_N", cfg.force_viz_length_per_n)
+
+
 def load_safe_attitude_deg(*, deg: float | None = None, default_deg: float = 70.0) -> float:
     """Max tilt from vertical (degrees): angle between body +Z and world +Z."""
     if deg is not None:
@@ -621,6 +649,7 @@ def build_hover_env_config(
         cfg.max_xy = max(cfg.max_xy, 12.0)
     if episode_seconds is not None:
         cfg.max_episode_steps = episode_steps_for_seconds(episode_seconds)
+    apply_force_viz_settings(cfg)
     return cfg
 
 
@@ -651,6 +680,7 @@ def build_nav_env_config(
     safe_attitude_deg: float | None = None,
     hover_balance: bool | None = None,
     episode_seconds: float | None = None,
+    wind_viz_raw: bool | None = None,
 ) -> NavEnvConfig:
     from quad_hover_env import episode_steps_for_seconds
 
@@ -709,4 +739,5 @@ def build_nav_env_config(
     if episode_seconds is not None:
         cfg.max_episode_steps = episode_steps_for_seconds(episode_seconds)
     sync_max_motor_scale(cfg)
+    apply_force_viz_settings(cfg, wind_viz_raw=wind_viz_raw)
     return cfg

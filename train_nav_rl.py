@@ -34,7 +34,7 @@ from env_config import (
     describe_ppo_resume_settings,
     resolve_model_zip_path,
 )
-from ppo_callbacks import StopTrainingOnEvalPatience
+from ppo_callbacks import MetricsCsvCallback, NavEvalCallback, StopTrainingOnEvalPatience
 from quad_nav_env import QuadNavEnv, QuadNavGymEnv, make_nav_env
 
 
@@ -68,7 +68,10 @@ def build_vec_env(
             motor_thrust_min=motor_thrust_min,
             motor_thrust_max=motor_thrust_max,
         )
-        return Monitor(QuadNavGymEnv(cfg))
+        return Monitor(
+            QuadNavGymEnv(cfg),
+            info_keywords=("terminal_reason",),
+        )
 
     # DummyVecEnv: one PyBullet client per env, reliable on Windows.
     return make_vec_env(_factory, n_envs=n_envs, seed=seed, vec_env_cls=DummyVecEnv)
@@ -105,7 +108,7 @@ def _create_ppo(
 def train(args: argparse.Namespace) -> Path:
     _require_gym()
     from stable_baselines3 import PPO
-    from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+    from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -242,17 +245,25 @@ def train(args: argparse.Namespace) -> Path:
             verbose=1,
         )
 
-    callbacks.append(
-        EvalCallback(
-            eval_env,
-            best_model_save_path=str(out_dir / "best") if ckpt_settings.save_best else None,
-            log_path=str(out_dir / "eval"),
-            eval_freq=max(eval_settings.eval_freq // args.n_envs, 1),
-            n_eval_episodes=eval_settings.n_eval_episodes,
-            deterministic=True,
-            callback_after_eval=early_stop_cb,
-        )
+    metrics_csv = out_dir / "metrics.csv"
+    eval_cb = NavEvalCallback(
+        eval_env,
+        best_model_save_path=str(out_dir / "best") if ckpt_settings.save_best else None,
+        log_path=str(out_dir / "eval"),
+        eval_freq=max(eval_settings.eval_freq // args.n_envs, 1),
+        n_eval_episodes=eval_settings.n_eval_episodes,
+        deterministic=True,
     )
+    metrics_cb = MetricsCsvCallback(metrics_csv, eval_callback=eval_cb, verbose=1)
+    after_eval: list = [metrics_cb]
+    if early_stop_cb is not None:
+        after_eval.append(early_stop_cb)
+    eval_cb.callback_after_eval = (
+        after_eval[0] if len(after_eval) == 1 else CallbackList(after_eval)
+    )
+    callbacks.append(eval_cb)
+    callbacks.append(metrics_cb)
+    print(f"Metrics CSV: {metrics_csv}")
 
     model.learn(
         total_timesteps=args.timesteps,
@@ -286,6 +297,7 @@ def evaluate(args: argparse.Namespace) -> None:
         motor_thrust_max=args.motor_thrust_max,
         gui_realtime=args.realtime,
         gui_fast=args.fast,
+        wind_viz_raw=args.wind_viz_raw,
     )
     print(f"Action mode: {cfg.action_mode}")
     print(f"Wind: {describe_nav_wind_settings(cfg, cli_no_wind=args.no_wind)}")
@@ -502,6 +514,11 @@ def main() -> None:
         "--no-viz",
         action="store_true",
         help="GUI eval: disable force/wind debug arrows (smoother FPS)",
+    )
+    parser.add_argument(
+        "--wind-viz-raw",
+        action="store_true",
+        help="GUI: show wind as air velocity (m/s) instead of drag force (N); longer arrows",
     )
     args = parser.parse_args()
 

@@ -16,7 +16,7 @@ import math
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -100,11 +100,14 @@ class EnvConfig:
     step_sleep_s: float = 0.0
     show_wind_visualization: bool = True  # drag-force arrows in GUI when wind is enabled
     show_thrust_visualization: bool = True  # green thrust arrows at each motor in GUI
-    # Shared scale for all force arrows (N): same length per Newton for drag, thrust, weight.
+    # Shared scale for force arrows (N): thrust, weight, and drag when force_viz_wind_mode=drag_n.
     force_viz_length_per_n: float = 0.12
     force_viz_min_length: float = 0.04
     force_viz_max_length: float = 1.2
     force_viz_update_stride: int = 1
+    # Wind arrows: drag (N) by default; wind_ms shows air velocity (m/s) with longer arrows.
+    force_viz_wind_mode: Literal["drag_n", "wind_ms"] = "drag_n"
+    force_viz_length_per_ms: float = 1.0
     wind: WindConfig = field(default_factory=WindConfig)
     wind_settings: "WindSettings | None" = None
     # PD hover controller (used when action is None)
@@ -274,6 +277,10 @@ class QuadHoverEnv:
     @staticmethod
     def _force_viz_scale(cfg: EnvConfig) -> tuple[float, float, float]:
         return (cfg.force_viz_length_per_n, cfg.force_viz_min_length, cfg.force_viz_max_length)
+
+    @staticmethod
+    def _wind_viz_scale(cfg: EnvConfig) -> tuple[float, float, float]:
+        return (cfg.force_viz_length_per_ms, cfg.force_viz_min_length, cfg.force_viz_max_length)
 
     @staticmethod
     def _vec_add(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:
@@ -446,31 +453,43 @@ class QuadHoverEnv:
             mean_drag = self._drag_force_vector(rel_mean)
             eff_drag = self._drag_force_vector(rel_eff)
             applied_drag = self._last_wind_info["force"]
+            wind_raw = self.cfg.force_viz_wind_mode == "wind_ms"
+            if wind_raw:
+                mean_arrow = rel_mean
+                eff_arrow = rel_eff
+                wind_length_per_unit, wind_min_len, wind_max_len = self._wind_viz_scale(self.cfg)
+                mean_mag = self._force_magnitude(mean_arrow)
+                eff_mag = self._force_magnitude(eff_arrow)
+            else:
+                mean_arrow = mean_drag
+                eff_arrow = eff_drag
+                wind_length_per_unit, wind_min_len, wind_max_len = length_per_n, min_len, max_len
+                mean_mag = self._force_magnitude(mean_drag)
+                eff_mag = self._force_magnitude(eff_drag)
 
             idx = self._draw_force_arrow(
                 line_ids,
                 idx,
                 drone_origin,
-                mean_drag,
+                mean_arrow,
                 color=[0.15, 0.75, 1.0],
-                length_per_n=length_per_n,
-                min_length=min_len,
-                max_length=max_len,
+                length_per_n=wind_length_per_unit,
+                min_length=wind_min_len,
+                max_length=wind_max_len,
                 width=2.2,
             )
-            eff_mag = self._force_magnitude(eff_drag)
             idx = self._draw_force_arrow(
                 line_ids,
                 idx,
                 (drone_origin[0], drone_origin[1], drone_origin[2] + 0.08),
-                eff_drag,
-                color=self._force_magnitude_color(eff_mag),
-                length_per_n=length_per_n,
-                min_length=min_len,
-                max_length=max_len,
+                eff_arrow,
+                color=self._force_magnitude_color(eff_mag, ref_n=1.0 if wind_raw else 3.0),
+                length_per_n=wind_length_per_unit,
+                min_length=wind_min_len,
+                max_length=wind_max_len,
                 width=2.8,
             )
-            if wcfg.viz_show_applied_drag:
+            if wcfg.viz_show_applied_drag and not wind_raw:
                 applied_mag = self._force_magnitude(applied_drag)
                 idx = self._draw_force_arrow(
                     line_ids,
@@ -497,17 +516,21 @@ class QuadHoverEnv:
                         line_ids,
                         idx,
                         (ox, oy, z),
-                        mean_drag,
+                        mean_arrow,
                         color=[0.15, 0.75, 1.0],
-                        length_per_n=length_per_n,
-                        min_length=min_len,
-                        max_length=max_len,
+                        length_per_n=wind_length_per_unit,
+                        min_length=wind_min_len,
+                        max_length=wind_max_len,
                         width=1.5,
                         draw_head=False,
                     )
 
-            label_parts.append(f"drag(mean) {self._force_magnitude(mean_drag):.2f} N")
-            label_parts.append(f"drag(eff) {eff_mag:.2f} N")
+            if wind_raw:
+                label_parts.append(f"wind(mean) {mean_mag:.3f} m/s")
+                label_parts.append(f"wind(eff) {eff_mag:.3f} m/s")
+            else:
+                label_parts.append(f"drag(mean) {mean_mag:.2f} N")
+                label_parts.append(f"drag(eff) {eff_mag:.2f} N")
 
         if show_thrust:
             thrust_dir = self._last_thrust_dir
@@ -565,7 +588,7 @@ class QuadHoverEnv:
             label_parts.append(f"weight {MASS * 9.81:.2f} N")
 
         if not label_parts:
-            label = "force viz (N)"
+            label = "force viz (wind m/s)" if self.cfg.force_viz_wind_mode == "wind_ms" else "force viz (N)"
         else:
             label = "  ".join(label_parts)
         text_pos = (anchor[0], anchor[1], anchor[2] + 0.55)
