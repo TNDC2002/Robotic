@@ -107,7 +107,7 @@ class EnvConfig:
     force_viz_update_stride: int = 1
     # Wind arrows: drag (N) by default; wind_ms shows air velocity (m/s) with longer arrows.
     force_viz_wind_mode: Literal["drag_n", "wind_ms"] = "drag_n"
-    force_viz_length_per_ms: float = 1.0
+    force_viz_length_per_ms: float = 3.0
     wind: WindConfig = field(default_factory=WindConfig)
     wind_settings: "WindSettings | None" = None
     # PD hover controller (used when action is None)
@@ -455,8 +455,11 @@ class QuadHoverEnv:
             applied_drag = self._last_wind_info["force"]
             wind_raw = self.cfg.force_viz_wind_mode == "wind_ms"
             if wind_raw:
-                mean_arrow = rel_mean
-                eff_arrow = rel_eff
+                # World-frame m/s (matches training obs + episode sample from .env), not air-relative.
+                world_eff = self._last_wind_info["velocity"]
+                mean_arrow = mean_wind
+                eff_arrow = world_eff
+                field_arrow = wcfg.velocity
                 wind_length_per_unit, wind_min_len, wind_max_len = self._wind_viz_scale(self.cfg)
                 mean_mag = self._force_magnitude(mean_arrow)
                 eff_mag = self._force_magnitude(eff_arrow)
@@ -516,7 +519,7 @@ class QuadHoverEnv:
                         line_ids,
                         idx,
                         (ox, oy, z),
-                        mean_arrow,
+                        field_arrow if wind_raw else mean_arrow,
                         color=[0.15, 0.75, 1.0],
                         length_per_n=wind_length_per_unit,
                         min_length=wind_min_len,
@@ -526,6 +529,8 @@ class QuadHoverEnv:
                     )
 
             if wind_raw:
+                sample_mag = self._force_magnitude(field_arrow)
+                label_parts.append(f"wind(sample) {sample_mag:.3f} m/s")
                 label_parts.append(f"wind(mean) {mean_mag:.3f} m/s")
                 label_parts.append(f"wind(eff) {eff_mag:.3f} m/s")
             else:

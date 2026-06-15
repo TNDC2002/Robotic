@@ -5,7 +5,8 @@ Each episode draws wind from ``WIND_*_MIN/MAX`` in ``.env`` (identical to ``trai
 
 Run:
   python rl_interact_demo.py --gui --hover-balance
-  python rl_interact_demo.py --gui --hover-balance --seconds 60
+  python rl_interact_demo.py --gui --hover-balance --wind-viz-raw
+  python rl_interact_demo.py --gui --hover-balance --wind-viz-raw --seed 0
 """
 
 from __future__ import annotations
@@ -55,6 +56,7 @@ def run_episode(
     no_wind: bool = False,
     hover_balance: bool = True,
     wind_viz_raw: bool = False,
+    seed: int | None = None,
 ) -> None:
     from env_config import build_nav_env_config, hover_thrust_per_motor_n
     from wind_settings import describe_sampled_wind, describe_wind_settings
@@ -98,15 +100,19 @@ def run_episode(
         print("  Mode: neutral motor action (0) — use --hover-balance for wind-tunnel view")
     if cfg.force_viz_wind_mode == "wind_ms":
         print(
-            f"  Wind viz: raw air velocity (m/s), scale={cfg.force_viz_length_per_ms} m per (m/s)"
+            f"  Wind viz: episode wind field (m/s), scale={cfg.force_viz_length_per_ms} m per (m/s)"
         )
     else:
         print("  Wind viz: drag force (N)")
+    if seed is not None:
+        print(f"  Episode seed: {seed} (reproducible wind draw)")
+    else:
+        print("  Episode seed: random (new wind draw each run)")
     print(f"  Goal (nav task): {env._goal_pos}")
     print(f"  Observation size: {env.observation_size} floats")
     print()
 
-    obs = env.reset(seed=0)
+    obs = env.reset(seed=seed)
     if cfg.wind.enabled:
         print(f"  {describe_sampled_wind(cfg.wind)}")
         print()
@@ -197,7 +203,13 @@ def main() -> None:
     parser.add_argument(
         "--wind-viz-raw",
         action="store_true",
-        help="Show wind as air velocity (m/s) instead of drag (N); longer arrows",
+        help="Show episode wind field (m/s) from .env sampling; longer arrows than drag (N)",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Episode RNG seed (default: random wind draw from WIND_* ranges each run)",
     )
     args = parser.parse_args()
     if args.steps is not None and args.seconds is not None:
@@ -232,6 +244,7 @@ def main() -> None:
         no_wind=args.no_wind,
         hover_balance=hover_balance,
         wind_viz_raw=args.wind_viz_raw,
+        seed=args.seed,
     )
 
 

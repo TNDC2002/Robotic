@@ -22,8 +22,9 @@ METRICS_CSV_COLUMNS = (
 class StopTrainingOnEvalPatience(BaseCallback):
     """Stop training when eval mean reward fails to improve for ``patience`` evaluations.
 
-    Attach as ``callback_after_eval`` on ``EvalCallback``. Uses ``EvalCallback.last_mean_reward``
-    after each evaluation round.
+    Pass to ``EvalCallback(..., callback_after_eval=...)`` — SB3 stores that as
+    ``EvalCallback.callback`` and runs it after each eval. Assigning
+    ``eval_cb.callback_after_eval`` after construction does not wire it up.
     """
 
     parent: EvalCallback
@@ -190,8 +191,6 @@ class MetricsCsvCallback(BaseCallback):
                 "n_episodes": eval_settings_episodes(self.eval_callback),
             }
         )
-        if self.verbose >= 1:
-            print(f"Metrics CSV: logged eval row at {self.num_timesteps:,} timesteps -> {self.csv_path}")
         return True
 
 

@@ -108,7 +108,7 @@ def _create_ppo(
 def train(args: argparse.Namespace) -> Path:
     _require_gym()
     from stable_baselines3 import PPO
-    from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+    from stable_baselines3.common.callbacks import CheckpointCallback
 
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -253,14 +253,9 @@ def train(args: argparse.Namespace) -> Path:
         eval_freq=max(eval_settings.eval_freq // args.n_envs, 1),
         n_eval_episodes=eval_settings.n_eval_episodes,
         deterministic=True,
+        callback_after_eval=early_stop_cb,
     )
-    metrics_cb = MetricsCsvCallback(metrics_csv, eval_callback=eval_cb, verbose=1)
-    after_eval: list = [metrics_cb]
-    if early_stop_cb is not None:
-        after_eval.append(early_stop_cb)
-    eval_cb.callback_after_eval = (
-        after_eval[0] if len(after_eval) == 1 else CallbackList(after_eval)
-    )
+    metrics_cb = MetricsCsvCallback(metrics_csv, eval_callback=eval_cb)
     callbacks.append(eval_cb)
     callbacks.append(metrics_cb)
     print(f"Metrics CSV: {metrics_csv}")
