@@ -108,6 +108,7 @@ class EnvConfig:
     # Wind arrows: drag (N) by default; wind_ms shows air velocity (m/s) with longer arrows.
     force_viz_wind_mode: Literal["drag_n", "wind_ms"] = "drag_n"
     force_viz_length_per_ms: float = 3.0
+    force_viz_wind_length_scale: float = 100.0  # extra multiplier for wind_ms arrows only
     wind: WindConfig = field(default_factory=WindConfig)
     wind_settings: "WindSettings | None" = None
     # PD hover controller (used when action is None)
@@ -280,7 +281,12 @@ class QuadHoverEnv:
 
     @staticmethod
     def _wind_viz_scale(cfg: EnvConfig) -> tuple[float, float, float]:
-        return (cfg.force_viz_length_per_ms, cfg.force_viz_min_length, cfg.force_viz_max_length)
+        s = cfg.force_viz_wind_length_scale
+        return (
+            cfg.force_viz_length_per_ms * s,
+            cfg.force_viz_min_length * s,
+            cfg.force_viz_max_length * s,
+        )
 
     @staticmethod
     def _vec_add(a: tuple[float, float, float], b: tuple[float, float, float]) -> tuple[float, float, float]:

@@ -293,6 +293,7 @@ def evaluate(args: argparse.Namespace) -> None:
         gui_realtime=args.realtime,
         gui_fast=args.fast,
         wind_viz_raw=args.wind_viz_raw,
+        wind_viz_scale=args.wind_viz_scale,
     )
     print(f"Action mode: {cfg.action_mode}")
     print(f"Wind: {describe_nav_wind_settings(cfg, cli_no_wind=args.no_wind)}")
@@ -514,6 +515,13 @@ def main() -> None:
         "--wind-viz-raw",
         action="store_true",
         help="GUI: show wind as air velocity (m/s) instead of drag force (N); longer arrows",
+    )
+    parser.add_argument(
+        "--wind-viz-scale",
+        type=float,
+        default=None,
+        metavar="N",
+        help="GUI --wind-viz-raw: multiply wind arrow length (default: FORCE_VIZ_WIND_LENGTH_SCALE in .env, else 100)",
     )
     args = parser.parse_args()
 

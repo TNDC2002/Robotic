@@ -151,11 +151,20 @@ def apply_force_viz_settings(
     cfg: "EnvConfig | NavEnvConfig",
     *,
     wind_viz_raw: bool | None = None,
+    wind_viz_scale: float | None = None,
 ) -> None:
     from quad_hover_env import EnvConfig
 
     cfg.force_viz_wind_mode = load_force_viz_wind_mode(cli_raw=wind_viz_raw)
     cfg.force_viz_length_per_ms = _env_float("FORCE_VIZ_LENGTH_PER_MS", cfg.force_viz_length_per_ms)
+    if wind_viz_scale is not None:
+        if wind_viz_scale <= 0.0:
+            raise ValueError(f"wind viz scale must be > 0, got {wind_viz_scale}")
+        cfg.force_viz_wind_length_scale = wind_viz_scale
+    else:
+        cfg.force_viz_wind_length_scale = _env_float(
+            "FORCE_VIZ_WIND_LENGTH_SCALE", cfg.force_viz_wind_length_scale
+        )
     if isinstance(cfg, EnvConfig):
         cfg.force_viz_length_per_n = _env_float("FORCE_VIZ_LENGTH_PER_N", cfg.force_viz_length_per_n)
 
@@ -681,6 +690,7 @@ def build_nav_env_config(
     hover_balance: bool | None = None,
     episode_seconds: float | None = None,
     wind_viz_raw: bool | None = None,
+    wind_viz_scale: float | None = None,
 ) -> NavEnvConfig:
     from quad_hover_env import episode_steps_for_seconds
 
@@ -739,5 +749,5 @@ def build_nav_env_config(
     if episode_seconds is not None:
         cfg.max_episode_steps = episode_steps_for_seconds(episode_seconds)
     sync_max_motor_scale(cfg)
-    apply_force_viz_settings(cfg, wind_viz_raw=wind_viz_raw)
+    apply_force_viz_settings(cfg, wind_viz_raw=wind_viz_raw, wind_viz_scale=wind_viz_scale)
     return cfg

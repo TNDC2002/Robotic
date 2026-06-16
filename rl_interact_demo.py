@@ -6,6 +6,7 @@ Each episode draws wind from ``WIND_*_MIN/MAX`` in ``.env`` (identical to ``trai
 Run:
   python rl_interact_demo.py --gui --hover-balance
   python rl_interact_demo.py --gui --hover-balance --wind-viz-raw
+  python rl_interact_demo.py --gui --hover-balance --wind-viz-raw --wind-viz-scale 50
   python rl_interact_demo.py --gui --hover-balance --wind-viz-raw --seed 0
 """
 
@@ -56,6 +57,7 @@ def run_episode(
     no_wind: bool = False,
     hover_balance: bool = True,
     wind_viz_raw: bool = False,
+    wind_viz_scale: float | None = None,
     seed: int | None = None,
 ) -> None:
     from env_config import build_nav_env_config, hover_thrust_per_motor_n
@@ -69,6 +71,7 @@ def run_episode(
         gui_unlimited=True,
         episode_seconds=episode_seconds,
         wind_viz_raw=wind_viz_raw,
+        wind_viz_scale=wind_viz_scale,
     )
     if max_steps is not None:
         cfg.max_episode_steps = max_steps
@@ -99,8 +102,11 @@ def run_episode(
     else:
         print("  Mode: neutral motor action (0) — use --hover-balance for wind-tunnel view")
     if cfg.force_viz_wind_mode == "wind_ms":
+        eff_scale = cfg.force_viz_length_per_ms * cfg.force_viz_wind_length_scale
         print(
-            f"  Wind viz: episode wind field (m/s), scale={cfg.force_viz_length_per_ms} m per (m/s)"
+            f"  Wind viz: episode wind field (m/s), "
+            f"scale={eff_scale:g} m per (m/s) "
+            f"({cfg.force_viz_length_per_ms:g} × {cfg.force_viz_wind_length_scale:g})"
         )
     else:
         print("  Wind viz: drag force (N)")
@@ -206,6 +212,13 @@ def main() -> None:
         help="Show episode wind field (m/s) from .env sampling; longer arrows than drag (N)",
     )
     parser.add_argument(
+        "--wind-viz-scale",
+        type=float,
+        default=None,
+        metavar="N",
+        help="Multiply wind arrow length in --wind-viz-raw mode (default: FORCE_VIZ_WIND_LENGTH_SCALE in .env, else 100)",
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -244,6 +257,7 @@ def main() -> None:
         no_wind=args.no_wind,
         hover_balance=hover_balance,
         wind_viz_raw=args.wind_viz_raw,
+        wind_viz_scale=args.wind_viz_scale,
         seed=args.seed,
     )
 
